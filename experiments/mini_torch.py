@@ -1,7 +1,7 @@
-"""学习阶段 19：单头 Self-Attention 与因果掩码。
+"""学习阶段 20：FFN、残差连接与完整 Transformer Block。
 
 运行：python experiments/mini_torch.py
-掩码为非可微常量，在 softmax 前加负无穷；每行保留对角线，避免整行被屏蔽。
+全部由已实现的可微操作组合；递归参数遍历覆盖 LayerNorm、Attention 和 FFN。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -1234,21 +1234,38 @@ class CausalSelfAttention(Module):
         return self.projection(self.attention_weights @ v)
 
 
+class FeedForward(Module):
+    def __init__(self, d_model: int, d_ff: int, *, rng: random.Random | None = None) -> None:
+        super().__init__("FeedForward")
+        self.up = Linear(d_model, d_ff, rng=rng)
+        self.down = Linear(d_ff, d_model, rng=rng)
+
+    def forward(self, x: Value) -> Value:
+        return self.down(self.up(x).relu())
+
+
+class TransformerBlock(Module):
+    """Pre-LN：残差支路形状不变，FFN 末层不使用 ReLU。"""
+    def __init__(self, d_model: int, d_ff: int, *, rng: random.Random | None = None) -> None:
+        super().__init__("TransformerBlock")
+        self.norm1, self.norm2 = LayerNorm(d_model), LayerNorm(d_model)
+        self.attention = CausalSelfAttention(d_model, rng=rng)
+        self.ffn = FeedForward(d_model, d_ff, rng=rng)
+
+    def forward(self, x: Value) -> Value:
+        h = x + self.attention(self.norm1(x))
+        return h + self.ffn(self.norm2(h))
+
+
 def main() -> None:
-    attn = CausalSelfAttention(4, rng=random.Random(3))
-    x = Value(_Meta([.1,.2,.3,.4, .2,.4,.6,.8, .4,.3,.2,.1], (3,4)))
-    y = attn(x)
-    weights = attn.attention_weights.data
-    assert weights[1] == weights[2] == weights[5] == 0
+    block = TransformerBlock(4, 8, rng=random.Random(9))
+    x = Value(_Meta([.1,.2,.3,.4, .2,.5,-.2,.8, .4,.3,.2,-.1], (3,4)))
+    y = block(x)
+    assert y.shape == x.shape
     (y * y).mean().backward()
-    assert all(p.grad is not None for p in attn.parameters())
-    with no_grad():
-        changed = x.data.copy()
-        changed[-4:] = [100,200,300,400]
-        future_changed = attn(Value(_Meta(changed, x.shape), require_grad=False))
-    assert all(math.isclose(a,b) for a,b in zip(y.data[:8], future_changed.data[:8], strict=True))
-    print("因果 Attention 输出：", y.data)
-    print("修改未来 token 不影响前两个位置：通过")
+    params = list(block.parameters())
+    assert len(params) == 16 and all(p.grad is not None for p in params)
+    print("Transformer Block 输出形状：", y.shape, "参数张量数：", len(params))
 
 
 if __name__ == "__main__":
