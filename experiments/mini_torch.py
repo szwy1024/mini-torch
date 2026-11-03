@@ -1,7 +1,7 @@
-"""学习阶段 14：递归 Module、共享参数去重及 SGD。
+"""学习阶段 15：通用 Linear 与带标签的回归训练。
 
 运行：python experiments/mini_torch.py
-修复任意层级遍历、属性删除清理；debug 标签不递归复制整个计算表达式。
+Xavier uniform 初始化、零偏置、输出层不加 ReLU；固定随机种子的回归演示验证损失下降。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -1052,43 +1052,48 @@ class Module:
         self._modules.pop(name, None)
 
 
-class Liner(Module):
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
-        self.x = Parameter(_Meta([1, -2, 3, 4, -5, -6,4,5,-4], [3, 3]))
-        self.y = Parameter(_Meta([2, -3, 4], [3,]))
+class Linear(Module):
+    """任意正整数输入/输出维度；末维做投影，显式广播偏置。"""
+    def __init__(self, in_features: int, out_features: int, *, bias: bool = True,
+                 rng: random.Random | None = None) -> None:
+        super().__init__("Linear")
+        if type(in_features) is not int or type(out_features) is not int or min(in_features, out_features) < 1:
+            raise ValueError("Linear 的输入、输出维度必须是正整数")
+        if type(bias) is not bool:
+            raise TypeError("bias 必须是 bool")
+        self.in_features, self.out_features = in_features, out_features
+        generator = rng if rng is not None else random
+        bound = math.sqrt(6.0 / (in_features + out_features))
+        self.weight = Parameter(_Meta(
+            [generator.uniform(-bound, bound) for _ in range(in_features * out_features)],
+            (in_features, out_features)), name="weight")
+        self.bias = Parameter(_Meta([0] * out_features, (out_features,)), name="bias") if bias else None
 
-    def forward(self, input: Value) -> Value:
-        self.mul = input @ self.x
-        self.bias = self.y.broadcast_to(self.mul.shape)
-        return self.mul + self.bias
+    def forward(self, x: Value) -> Value:
+        if len(x.shape) < 2 or x.shape[-1] != self.in_features:
+            raise ValueError("Linear 输入至少二维，末维必须等于 in_features")
+        result = x @ self.weight
+        return result if self.bias is None else result + self.bias.broadcast_to(result.shape)
 
-class myModule(Module):
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
-        self.linner1 = Liner("liner1")
-        self.linner2 = Liner("liner2")
-        self.linner3 = Liner("liner3")
 
-    def forward(self, input: Value) -> Value:
-        self.hidden1 = self.linner1.forward(input).relu()
-        self.hidden2 = self.linner2.forward(self.hidden1).relu()
-        self.hidden3 = self.linner3.forward(self.hidden2)
-        self.hidden4 = self.hidden3.sum(dim=0).reshape((1,3))
-
-        return  self.hidden4 
 
 def main() -> None:
-    root = Module("root")
-    root.child = Module("child")
-    root.child.weight = Parameter(_Meta([2], ()), name="weight")
-    root.alias = root.child.weight
-    assert len(list(root.parameters())) == 1
-    opt = SGD(root.parameters(), lr=0.1)
-    (root.child.weight * root.child.weight).backward()
-    opt.step()
-    assert abs(root.child.weight.data[0] - 1.6) < 1e-12
-    print("嵌套参数去重与 SGD：", root.child.weight.data)
+    rng = random.Random(7)
+    first, last = Linear(2, 8, rng=rng), Linear(8, 1, rng=rng)
+    x = Value(_Meta([-1,-1, -1,1, 1,-1, 1,1], (4,2)), require_grad=False)
+    target = Value(_Meta([1.5,-4.5,5.5,-.5], (4,1)), require_grad=False)
+    opt = SGD(iter([*first.parameters(), *last.parameters()]), lr=0.04)
+    history = []
+    for _ in range(120):
+        opt.zero_grad()
+        pred = last(first(x).relu())
+        diff = pred - target
+        loss = (diff * diff).sum() * 0.25
+        history.append(loss.data[0])
+        loss.backward()
+        opt.step()
+    assert history[-1] < history[0] * 0.1
+    print("回归 MSE：", history[0], "→", history[-1])
 
 
 if __name__ == "__main__":
