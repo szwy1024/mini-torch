@@ -1,7 +1,7 @@
-"""学习阶段 21：Embedding、位置编码、交叉熵与自回归训练。
+"""学习阶段 22：批量 matmul、permute 与多头因果 Attention。
 
 运行：python experiments/mini_torch.py
-固定小词表循环序列，纯 Python 拟合下一 token；不依赖 torch，也不声称具备真实语言泛化能力。
+支持 (B,T,D) 输入和 batch 维广播；没有新增 NumPy/PyTorch 依赖。one-hot 嵌入仍以教学清晰为优先。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -15,6 +15,7 @@ from math import prod
 from math import exp, log
 import math
 import random
+from itertools import product as cartesian_product
 from typing import Callable, Generator, Sequence
 from typing import Iterator
 
@@ -141,6 +142,7 @@ class OpOptions:
     size: int | None = None
     keepdim: bool = False
     shape: tuple[int, ...] | None = None
+    axes: tuple[int, ...] | None = None
 
 
 class Backend:
@@ -190,22 +192,22 @@ class CPUBackend(Backend):
         return _Meta([value * scalar for value in x.data], x.shape)
 
     def matmul(self, x: _Meta, y: _Meta) -> _Meta:
-        """(m, k) @ (k, n) → (m, n)，仅支持二维矩阵。"""
-        if len(x.shape) != 2 or len(y.shape) != 2:
-            raise ValueError("matmul 当前只支持两个二维矩阵")
-        m, k = x.shape
-        other_k, n = y.shape
-        if k != other_k:
-            raise ValueError(f"矩阵内维不匹配：{x.shape} @ {y.shape}")
-        result = [0.0] * (m * n)
-        for row in range(m):
-            for col in range(n):
-                # 行优先：x[row, inner] 和 y[inner, col] 的一维下标。
-                result[row * n + col] = sum(
-                    x.data[row * k + inner] * y.data[inner * n + col]
-                    for inner in range(k)
-                )
-        return _Meta(result, (m, n))
+        """最后两维矩阵乘法；Value 层已显式对齐 batch 维。"""
+        if x.ndim < 2 or y.ndim < 2 or x.shape[:-2] != y.shape[:-2]:
+            raise ValueError("matmul 需要至少二维且 batch 维相同的输入")
+        rows, inner = x.shape[-2:]
+        other_inner, cols = y.shape[-2:]
+        if inner != other_inner:
+            raise ValueError("matmul 矩阵内维不匹配")
+        batch = prod(x.shape[:-2])
+        result = []
+        for group in range(batch):
+            for row in range(rows):
+                for col in range(cols):
+                    result.append(sum(x.data[group*rows*inner + row*inner+k]
+                                      * y.data[group*inner*cols+k*cols+col]
+                                      for k in range(inner)))
+        return _Meta(result, x.shape[:-2] + (rows, cols))
 
     def clone(self, x: _Meta) -> _Meta:
         return x.clone()
@@ -283,6 +285,7 @@ class CPUBackend(Backend):
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {
+            "permute": self.permute,
             "max": self.max,
             "sqrt": self.sqrt,
             "add": self.add,
@@ -307,6 +310,16 @@ class CPUBackend(Backend):
 
     def max(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
         return _max_reduce(x, dim, keepdim)[0]
+
+    def permute(self, x: _Meta, axes: Sequence[int]) -> _Meta:
+        axes = _check_permutation(axes, x.ndim)
+        shape = tuple(x.shape[axis] for axis in axes)
+        inverse = tuple(axes.index(axis) for axis in range(x.ndim))
+        data = []
+        for index in cartesian_product(*(range(width) for width in shape)):
+            source = tuple(index[inverse[axis]] for axis in range(x.ndim))
+            data.append(x.data[_flat_offset(source, x.shape)])
+        return _Meta(data, shape)
 
 
 class GPUBackend(Backend):
@@ -419,7 +432,17 @@ class Value:
         return self * scalar
 
     def __matmul__(self, other: Value) -> Value:
-        return _dispatch.call("matmul", self, other)
+        if not isinstance(other, Value):
+            raise TypeError("matmul 需要两个 Value")
+        if self.meta.ndim < 2 or other.meta.ndim < 2:
+            raise ValueError("matmul 当前不支持一维向量，输入至少二维")
+        if self.shape[-1] != other.shape[-2]:
+            raise ValueError("matmul 矩阵内维不匹配")
+        batch = _broadcast_shape(self.shape[:-2], other.shape[:-2])
+        left_shape, right_shape = batch + self.shape[-2:], batch + other.shape[-2:]
+        left = self if self.shape == left_shape else self.broadcast_to(left_shape)
+        right = other if other.shape == right_shape else other.broadcast_to(right_shape)
+        return _dispatch.call("matmul", left, right)
 
     def clone(self) -> Value:
         return _dispatch.call("clone", self)
@@ -524,6 +547,15 @@ class Value:
         normalizer = shifted.exp().sum(axis, keepdim=True).log()
         return shifted - normalizer.broadcast_to(self.shape)
 
+    def permute(self, axes: Sequence[int]) -> Value:
+        return _dispatch.call("permute", self, axes=axes)
+
+    def swapaxes(self, first: int, second: int) -> Value:
+        first, second = _normalize_dim(first, self.meta.ndim), _normalize_dim(second, self.meta.ndim)
+        axes = list(range(self.meta.ndim))
+        axes[first], axes[second] = axes[second], axes[first]
+        return self.permute(axes)
+
 
 class Autograd:
     """前向和反向的 Value 运算共用此层，是否建图由当前梯度模式决定。"""
@@ -570,6 +602,12 @@ class Autograd:
                     lambda grad_out: (grad_out * saved["save"].exp(),),
                     name=f"ExpBackward({x.name})",
                 )
+            elif op == "permute":
+                axes = options.axes
+                if axes is None:
+                    raise RuntimeError("permute 缺少已验证的维度排列")
+                inverse = tuple(axes.index(axis) for axis in range(len(axes)))
+                node = InnerNode([x.node], lambda g: (g.permute(inverse),), name="PermuteBackward")
             elif op == "max":
                 _, mask_meta = _max_reduce(x.meta, options.dim, options.keepdim)
                 mask = Value(mask_meta, require_grad=False)
@@ -716,8 +754,8 @@ class Autograd:
 
                         def matmul_backward(grad_out: Value) -> tuple[Value, ...]:
                             return (
-                                grad_out @ saved["right"].T,
-                                saved["left"].T @ grad_out,
+                                grad_out @ saved["right"].swapaxes(-1, -2),
+                                saved["left"].swapaxes(-1, -2) @ grad_out,
                             )
 
                         backrule = matmul_backward
@@ -762,6 +800,8 @@ class ExecuteLayer:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
+        if op == "permute":
+            return kernel(x, options.axes)
         if op == "max":
             return kernel(x, options.dim, keepdim=options.keepdim)
         if op == "sqrt":
@@ -789,6 +829,7 @@ class Dispatch:
             {
                 "sqrt",
                 "max",
+                "permute",
                 "add",
                 "sub",
                 "mul",
@@ -829,6 +870,7 @@ class Dispatch:
         size: int | None = None,
         keepdim: bool = False,
         shape: Sequence[int] | None = None,
+        axes: Sequence[int] | None = None,
     ) -> Value:
         if op not in self.operator:
             raise NotImplementedError(f"不支持 Value 算子 {op}")
@@ -846,6 +888,7 @@ class Dispatch:
             raise TypeError(f"{op} 不接受 shape")
 
         unary = {
+            "permute",
             "max",
             "sqrt",
             "transpose",
@@ -878,6 +921,9 @@ class Dispatch:
         elif op == "log":
             _check_log_input(x.meta)
 
+        if op != "permute" and axes is not None:
+            raise TypeError(f"{op} 不接受 axes")
+        normalized_axes = _check_permutation(axes, x.meta.ndim) if op == "permute" else None
         normalized_dim = dim
         if op in ("sum", "max") and dim is not None:
             normalized_dim = _normalize_dim(dim, x.meta.ndim)
@@ -893,7 +939,7 @@ class Dispatch:
             target = _check_shape(shape)
             if prod(target) != x.meta.numel:
                 raise ValueError(f"reshape 元素数不匹配：{x.shape} → {target}")
-        options = OpOptions(normalized_dim, size, keepdim, target)
+        options = OpOptions(normalized_dim, size, keepdim, target, normalized_axes)
         # 入参验证先于建图；no_grad 与正常模式执行相同的检查。
         return self.redispatch(op, x, y, options=options, exclude=frozenset())
 
@@ -1217,21 +1263,32 @@ def causal_mask(length: int) -> Value:
 
 
 class CausalSelfAttention(Module):
-    def __init__(self, d_model: int, *, rng: random.Random | None = None) -> None:
+    def __init__(self, d_model: int, *, num_heads: int = 1, rng: random.Random | None = None) -> None:
         super().__init__("CausalSelfAttention")
+        if type(d_model) is not int or d_model <= 0 or type(num_heads) is not int or num_heads <= 0 or d_model % num_heads:
+            raise ValueError("d_model 和 num_heads 必须为正整数，且 d_model 能被 num_heads 整除")
         self.query = Linear(d_model, d_model, rng=rng)
         self.key = Linear(d_model, d_model, rng=rng)
         self.value = Linear(d_model, d_model, rng=rng)
         self.projection = Linear(d_model, d_model, rng=rng)
-        self.d_model = d_model
+        self.d_model, self.num_heads = d_model, num_heads
 
     def forward(self, x: Value) -> Value:
-        if len(x.shape) != 2 or x.shape[0] == 0 or x.shape[1] != self.d_model:
-            raise ValueError("Attention 输入必须是非空 (序列长度, d_model)")
-        q, k, v = self.query(x), self.key(x), self.value(x)
-        scores = (q @ k.T) * (self.d_model ** -0.5)
-        self.attention_weights = (scores + causal_mask(x.shape[0])).softmax(-1)
-        return self.projection(self.attention_weights @ v)
+        if len(x.shape) not in (2,3) or x.shape[-1] != self.d_model or any(n == 0 for n in x.shape):
+            raise ValueError("Attention 输入必须是非空 (T,D) 或 (B,T,D)")
+        unbatched = len(x.shape) == 2
+        source = x.reshape((1,) + x.shape) if unbatched else x
+        batch, length, _ = source.shape
+        heads, head_dim = self.num_heads, self.d_model // self.num_heads
+        def split(projection: Linear) -> Value:
+            return projection(source).reshape((batch,length,heads,head_dim)).permute((0,2,1,3))
+        q, k, v = split(self.query), split(self.key), split(self.value)
+        scores = (q @ k.swapaxes(-1,-2)) * (head_dim ** -0.5)
+        masked = scores + causal_mask(length).broadcast_to(scores.shape)
+        self.attention_weights = masked.softmax(-1)
+        context = (self.attention_weights @ v).permute((0,2,1,3)).reshape((batch,length,self.d_model))
+        result = self.projection(context)
+        return result.reshape((length,self.d_model)) if unbatched else result
 
 
 class FeedForward(Module):
@@ -1246,10 +1303,11 @@ class FeedForward(Module):
 
 class TransformerBlock(Module):
     """Pre-LN：残差支路形状不变，FFN 末层不使用 ReLU。"""
-    def __init__(self, d_model: int, d_ff: int, *, rng: random.Random | None = None) -> None:
+    def __init__(self, d_model: int, d_ff: int, *, num_heads: int = 1,
+                 rng: random.Random | None = None) -> None:
         super().__init__("TransformerBlock")
         self.norm1, self.norm2 = LayerNorm(d_model), LayerNorm(d_model)
-        self.attention = CausalSelfAttention(d_model, rng=rng)
+        self.attention = CausalSelfAttention(d_model, num_heads=num_heads, rng=rng)
         self.ffn = FeedForward(d_model, d_ff, rng=rng)
 
     def forward(self, x: Value) -> Value:
@@ -1275,10 +1333,10 @@ class Embedding(Module):
         self.weight = Parameter(_Meta([generator.uniform(-.5,.5) for _ in range(vocab_size*d_model)],
                                      (vocab_size,d_model)), name="embedding")
 
-    def forward(self, tokens: Sequence[int]) -> Value:
-        tokens = _check_tokens(tokens, self.vocab_size)
-        one_hot = [float(token == col) for token in tokens for col in range(self.vocab_size)]
-        return Value(_Meta(one_hot, (len(tokens),self.vocab_size)), require_grad=False) @ self.weight
+    def forward(self, tokens: Sequence[int] | Sequence[Sequence[int]]) -> Value:
+        flat, shape = _token_layout(tokens, self.vocab_size)
+        one_hot = [float(token == col) for token in flat for col in range(self.vocab_size)]
+        return Value(_Meta(one_hot, shape + (self.vocab_size,)), require_grad=False) @ self.weight
 
 
 class PositionalEncoding(Module):
@@ -1289,29 +1347,32 @@ class PositionalEncoding(Module):
         self.d_model, self.max_seq_len = d_model, max_seq_len
 
     def forward(self, x: Value) -> Value:
-        if len(x.shape) != 2 or x.shape[1] != self.d_model or not 0 < x.shape[0] <= self.max_seq_len:
+        if len(x.shape) not in (2,3) or x.shape[-1] != self.d_model or not 0 < x.shape[-2] <= self.max_seq_len:
             raise ValueError("位置编码输入形状或长度不匹配")
+        length = x.shape[-2]
         values = [(math.sin if j%2 == 0 else math.cos)(pos / (10000 ** (2*(j//2)/self.d_model)))
-                  for pos in range(x.shape[0]) for j in range(self.d_model)]
-        return x + Value(_Meta(values, x.shape), require_grad=False)
+                  for pos in range(length) for j in range(self.d_model)]
+        positions = Value(_Meta(values, (length,self.d_model)), require_grad=False)
+        return x + positions.broadcast_to(x.shape)
 
 
-def cross_entropy(logits: Value, targets: Sequence[int]) -> Value:
-    if len(logits.shape) != 2 or logits.shape[0] == 0 or logits.shape[1] == 0:
-        raise ValueError("交叉熵需要非空 (序列长度, 词表大小) logits")
+def cross_entropy(logits: Value, targets: Sequence[int] | Sequence[Sequence[int]]) -> Value:
+    if len(logits.shape) not in (2,3) or any(n == 0 for n in logits.shape):
+        raise ValueError("交叉熵需要非空 (T,V) 或 (B,T,V) logits")
     if not all(math.isfinite(v) for v in logits.data):
         raise ValueError("交叉熵 logits 必须是有限值")
-    labels = _check_tokens(targets, logits.shape[1])
-    if len(labels) != logits.shape[0]:
-        raise ValueError("标签数与 logits 的序列长度不匹配")
-    one_hot = Value(_Meta([float(label == col) for label in labels for col in range(logits.shape[1])],
+    labels, shape = _token_layout(targets, logits.shape[-1])
+    if shape != logits.shape[:-1]:
+        raise ValueError("标签形状与 logits 的 batch/序列维不匹配")
+    one_hot = Value(_Meta([float(label == col) for label in labels for col in range(logits.shape[-1])],
                           logits.shape), require_grad=False)
     return (logits.log_softmax(-1) * one_hot).sum() * (-1.0 / len(labels))
 
 
 class TinyTransformerLM(Module):
     def __init__(self, vocab_size: int, d_model: int = 4, d_ff: int = 8,
-                 max_seq_len: int = 16, num_layers: int = 1, seed: int = 42) -> None:
+                 max_seq_len: int = 16, num_layers: int = 1, seed: int = 42,
+                 num_heads: int = 1) -> None:
         super().__init__("TinyTransformerLM")
         if type(num_layers) is not int or num_layers <= 0:
             raise ValueError("num_layers 必须是正整数")
@@ -1320,12 +1381,12 @@ class TinyTransformerLM(Module):
         self.position = PositionalEncoding(d_model, max_seq_len)
         self.block_names = tuple(f"block_{i}" for i in range(num_layers))
         for name in self.block_names:
-            setattr(self, name, TransformerBlock(d_model, d_ff, rng=rng))
+            setattr(self, name, TransformerBlock(d_model, d_ff, num_heads=num_heads, rng=rng))
         self.norm = LayerNorm(d_model)
         self.head = Linear(d_model, vocab_size, rng=rng)
         self.max_seq_len, self.vocab_size = max_seq_len, vocab_size
 
-    def forward(self, tokens: Sequence[int]) -> Value:
+    def forward(self, tokens: Sequence[int] | Sequence[Sequence[int]]) -> Value:
         x = self.position(self.embedding(tokens))
         for name in self.block_names:
             x = getattr(self, name)(x)
@@ -1342,21 +1403,72 @@ class TinyTransformerLM(Module):
         return result
 
 
+def _broadcast_shape(left: tuple[int, ...], right: tuple[int, ...]) -> tuple[int, ...]:
+    rank = max(len(left), len(right))
+    a, b = (1,) * (rank-len(left)) + left, (1,) * (rank-len(right)) + right
+    result = []
+    for x, y in zip(a, b, strict=True):
+        if x == y:
+            result.append(x)
+        elif x == 1:
+            result.append(y)
+        elif y == 1:
+            result.append(x)
+        else:
+            raise ValueError(f"batch 维度不兼容：{left} 与 {right}")
+    return tuple(result)
+
+
+def _check_permutation(axes: Sequence[int] | None, ndim: int) -> tuple[int, ...]:
+    if axes is None:
+        raise TypeError("permute 需要 axes")
+    values = tuple(axes)
+    if len(values) != ndim:
+        raise ValueError("permute 必须指定每一个维度")
+    normalized = tuple(_normalize_dim(axis, ndim) for axis in values)
+    if len(set(normalized)) != ndim:
+        raise ValueError("permute 的维度不能重复")
+    return normalized
+
+
+def _flat_offset(index: Sequence[int], shape: tuple[int, ...]) -> int:
+    offset = 0
+    for i, width in zip(index, shape, strict=True):
+        offset = offset * width + i
+    return offset
+
+
+def _token_layout(tokens: Sequence[int] | Sequence[Sequence[int]], vocab_size: int) -> tuple[list[int], tuple[int, ...]]:
+    rows = list(tokens)
+    if not rows:
+        raise ValueError("token 输入不能为空")
+    if all(type(token) is int for token in rows):
+        return _check_tokens(rows, vocab_size), (len(rows),)
+    if not all(isinstance(row, (list, tuple)) for row in rows):
+        raise ValueError("token 必须是整数序列或等长的二维整数序列")
+    checked = [_check_tokens(row, vocab_size) for row in rows]
+    width = len(checked[0])
+    if any(len(row) != width for row in checked):
+        raise ValueError("batch 中的序列长度必须相同；当前不做 padding")
+    return [token for row in checked for token in row], (len(rows), width)
+
+
 def main() -> None:
-    model = TinyTransformerLM(3)
-    tokens, targets = [0,1,2,0,1,2], [1,2,0,1,2,0]
-    optimizer = SGD(model.parameters(), lr=0.05)
+    model = TinyTransformerLM(3, d_model=6, d_ff=12, num_heads=2, max_seq_len=6)
+    tokens = [[0,1,2,0,1,2], [1,2,0,1,2,0], [2,0,1,2,0,1]]
+    targets = [[1,2,0,1,2,0], [2,0,1,2,0,1], [0,1,2,0,1,2]]
+    optimizer = SGD(model.parameters(), lr=0.06)
     losses = []
-    for step in range(60):
+    for step in range(80):
         optimizer.zero_grad()
         loss = cross_entropy(model(tokens), targets)
         losses.append(loss.data[0])
         loss.backward()
         optimizer.step()
-        if step in (0,19,39,59):
+        if step in (0,19,39,79):
             print(f"step={step:02d} cross_entropy={loss.data[0]:.6f}")
     assert losses[-1] < losses[0] * 0.5
-    print("greedy tokens：", model.generate([0,1,2], 6))
+    print("两个注意力头，batch=3；greedy tokens：", model.generate([0,1,2], 9))
 
 
 if __name__ == "__main__":
