@@ -1,7 +1,7 @@
-"""学习阶段 12：逐元素除法与自然对数。
+"""学习阶段 13：用已有可微算子组合显式广播。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch12.py；含定义域检查与可继续求导的反向规则。
+补建说明：源自 pytorch13.py；替换长训练演示为确定性广播验证，子模块完善留到下一提交。
 """
 
 from __future__ import annotations
@@ -424,6 +424,38 @@ class Value:
 
     def reshape(self, shape: Sequence[int]) -> Value:
         return _dispatch.call("reshape", self, shape=shape)
+
+    def broadcast_to(self, shape: Sequence[int]) -> Value:
+        """广播到目标形状；组合已有 Value 运算，不新增 kernel 或反向规则。
+
+        例如 (3,) → (2,3)，或 (2,1) → (2,3)。从右侧对齐维度，
+        每个输入维度必须与目标相等，或长度为 1；1 也可以扩展成 0。
+        返回物化副本，不共享存储；本接口暂不接受 -1 推断。
+        """
+        target = _check_shape(shape)
+        if len(target) < len(self.shape):
+            raise ValueError(
+                f"broadcast_to 目标维数不能少于输入：{self.shape} → {target}"
+            )
+
+        # 缺少的前导维度视为 1；先完整验证，避免非法目标触发部分计算和建图。
+        aligned = (1,) * (len(target) - len(self.shape)) + self.shape
+        for axis, (source_size, target_size) in enumerate(zip(aligned, target, strict=True)):
+            if source_size != target_size and source_size != 1:
+                raise ValueError(
+                    f"broadcast_to 形状不兼容：{self.shape} → {target}；"
+                    f"对齐后的第 {axis} 维 {source_size} 不能广播为 {target_size}"
+                )
+
+        # reshape 同时补齐前导维度并返回独立 Value，保持 no_grad 行为一致。
+        result = self.reshape(aligned)
+        for axis, (source_size, target_size) in enumerate(zip(aligned, target, strict=True)):
+            if source_size == target_size:
+                continue
+            # 现有 expand 只能插入新轴：先移除该长度为 1 的轴，再插入复制。
+            reduced = result.shape[:axis] + result.shape[axis + 1:]
+            result = result.reshape(reduced).expand(axis, target_size)
+        return result
 
     def exp(self) -> Value:
         return self.exponential()
@@ -973,34 +1005,61 @@ class Parameter(Value):
     pass
 
 
-class module:
+class Module:
     _parameters: dict[str, Parameter]
+    _modules: dict[str,Module]
 
     def __init__(self, name: str) -> None:
         object.__setattr__(self, "_parameters", {})
+        object.__setattr__(self,"_modules",{})
         self.name = name
 
     def __setattr__(self, name: str, value: object) -> None:
         parameter = self.__dict__.get("_parameters")
+        modules = self.__dict__.get("_modules")
         if isinstance(value, Parameter):
             if parameter is None:
                 raise RuntimeError("请先调用super().__init__()")
             parameter[name] = value
         elif parameter is not None:
             parameter.pop(name, None)
-
+        if isinstance(value,Module):
+            if modules is None:
+                raise RuntimeError("请先调用super().__init__()")
+            modules[name] = value
+        elif modules is not None:
+            modules.pop(name, None)
+       
         object.__setattr__(self, name, value)
 
     def parameter(self) -> Iterator[Parameter]:
-        seen: set[int] = set()
-        for param in self._parameters.values():
-            identity = id(param)
+        seen_params: set[int] = set()
+        seen_modules: set[int] = set()
 
-            if identity in seen:
+        moudles:deque[Module]  =deque([self])
+
+        def _get_parameter(module:Module)-> Iterator[Parameter]:
+            # 获取模块中的参数
+            for param in module._parameters.values():
+                identity = id(param)
+
+                if identity in seen_params:
+                    continue
+
+                seen_params.add(identity)
+                yield param
+
+        # 只要队列不空，出栈一个module，如果这个module没被访问过
+        # 获取它的全部参数，处理它包含的子module
+        while moudles:
+            module = moudles.popleft()
+            identity = id(module)
+            if identity in seen_modules:
                 continue
+            seen_modules.add(identity)
+            yield from _get_parameter(module)
+            moudles.extend(module._modules.values())
 
-            seen.add(identity)
-            yield param
 
     def forward(self, input: Value) -> Value:
         return input
@@ -1009,63 +1068,38 @@ class module:
         return self.forward(input)
 
 
-class myModulde(module):
+class Liner(Module):
     def __init__(self, name: str) -> None:
         super().__init__(name)
-        self.x = Parameter(_Meta([1, 2, -3, -4, 5, -6], [2, 3]), name="x")
-        self.y = Parameter(_Meta([2, -3, 4, 5, -6, 7], [3, 2]), name="y")
+        self.x = Parameter(_Meta([1, -2, 3, 4, -5, -6,4,5,-4], [3, 3]))
+        self.y = Parameter(_Meta([2, -3, 4], [3,]))
 
     def forward(self, input: Value) -> Value:
-        # (1,2) @ (2,3) @ (3,2) → (1,2)，随后对整个矩阵数乘。
-        self.hidden1 = input @ self.x
-        self.hidden2 = self.hidden1.relu()
-        self.hidden3 = (self.hidden2 @ self.y) * 0.5
-        self.hidden4 = self.hidden3.relu()
-        return self.hidden4 @ self.hidden4.T
+        self.mul = input @ self.x
+        self.bias = self.y.broadcast_to(self.mul.shape)
+        return self.mul + self.bias
 
+class myModule(Module):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.linner1 = Liner("liner1")
+        self.linner2 = Liner("liner2")
+        self.linner3 = Liner("liner3")
+
+    def forward(self, input: Value) -> Value:
+        self.hidden1 = self.linner1.forward(input).relu()
+        self.hidden2 = self.linner2.forward(self.hidden1).relu()
+        self.hidden3 = self.linner3.forward(self.hidden2)
+        self.hidden4 = self.hidden3.sum(dim=0).reshape((1,3))
+
+        return  self.hidden4 
 
 def main() -> None:
-    _dispatch._trace = False
-
-    z = Value(_Meta([1, -2, 3, -4, -5, 6], (2, 3)), name="z")
-    loss = (z * z).relu().sum()
-    loss.backward(create_graph=True)
-    first = z.grad
-    assert first is not None
-    z.grad = None
-    first.sum().backward()
-    print("平方和的二阶结果：", z.grad)  # 全部为 2
-
-    # 创建模型
-    model = myModulde("m1")
-    # 创建输入
-    input = Value(_Meta([1, 2], [1, 2]), name="input", require_grad=False)
-    # 得到输出
-
-    # 初始化一个优化器
-    opt = Optime(model.parameter(), lr=0.001)
-    # 清空梯度
-
-    for _ in range(10):
-
-        opt.zero_grad()
-
-        output = model(input)
-        print("-------更新前输出------")
-        print("output:", output)
-
-        # 反向传播
-        output.backward(
-            Value(_Meta.ones_like(output.meta), require_grad=False), _trace=False
-        )
-
-        # 使用梯度更新权重
-        opt.step()
-        with no_grad():
-            output = model(input)
-
-        print("-------更新后输出------")
-        print("output:", output)
+    x = Value(_Meta([1,2,3], (3,)), name="bias")
+    y = x.broadcast_to((2,3))
+    y.backward(Value(_Meta([1,2,3,4,5,6], (2,3)), require_grad=False))
+    assert y.data == [1,2,3,1,2,3] and x.grad.data == [5,7,9]
+    print("广播结果：", y.data, "原形状梯度：", x.grad.data)
 
 
 if __name__ == "__main__":
