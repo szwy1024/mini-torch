@@ -1,14 +1,43 @@
-"""学习阶段 06：Dispatcher 中独立的 Autograd 处理层。
+"""学习阶段 07：梯度模式与可继续求导的 Value 梯度。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch6.py；修复 x.meta 属性拼写，保留 redispatch 的教学结构。
+补建说明：源自 pytorch7.py；no_grad、create_graph 与高阶求导。
 """
 
 from __future__ import annotations
 
 from collections import deque
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from math import prod
-from typing import Callable, Sequence
+from typing import Callable,Generator, Sequence
+
+
+# ContextVar 保存当前执行上下文的状态，嵌套或异常退出时用 token 恢复。
+_grad_enabled: ContextVar[bool] = ContextVar("grad_enabled", default=True)
+
+
+def is_grad_enabled() -> bool:
+    return _grad_enabled.get()
+
+
+@contextmanager
+def set_grad_enabled(enabled: bool) -> Generator[None,None,None]:
+    """本例只支持 with 用法；不修改任何输入的 require_grad。"""
+    token = _grad_enabled.set(enabled)
+    try:
+        yield
+    finally:
+        # 退出时恢复上下文
+        _grad_enabled.reset(token)
+
+
+def no_grad() -> AbstractContextManager[None]:
+    return set_grad_enabled(False)
+
+
+def enable_grad() -> AbstractContextManager[None]:
+    return set_grad_enabled(True)
 
 
 class Storage:
@@ -100,6 +129,9 @@ class CPUBackend:
                 )
         return _Meta(result, (m, n))
 
+    def clone(self, x: _Meta) -> _Meta:
+        return x.clone()
+
     def transpose(self, x: _Meta) -> _Meta:
         """二维转置，返回独立的数据副本，不创建共享存储的视图。"""
         if len(x.shape) != 2:
@@ -112,18 +144,18 @@ class CPUBackend:
 
 
 class Node:
-    """反向边及局部求导接口；节点不保存一次任务的累计梯度。"""
+    """反向规则的输入、输出现在都是 Value，可以继续参与自动微分。"""
 
     def __init__(self, edge: list[Node | None], name: str) -> None:
         self.edge = edge
         self.name = name
 
-    def apply(self, grad_out: _Meta) -> tuple[_Meta, ...]:
+    def apply(self, grad_out: Value) -> tuple[Value, ...]:
         raise NotImplementedError("具体节点必须实现自己的反向行为")
 
 
 class LeafNode(Node):
-    """把梯度累加到叶子 Value，类似简化的 AccumulateGrad。"""
+    """累加叶子梯度；累加和复制也在 Engine 指定的梯度模式下执行。"""
 
     def __init__(self, value: Value) -> None:
         if not value.require_grad:
@@ -131,14 +163,11 @@ class LeafNode(Node):
         super().__init__(edge=[], name=f"LeafNode({value.name})")
         self.value = value
 
-    def apply(self, grad_out: _Meta) -> tuple[_Meta, ...]:
+    def apply(self, grad_out: Value) -> tuple[Value, ...]:
         if grad_out.shape != self.value.shape:
             raise ValueError("叶子的梯度形状必须与数据相同")
         previous = self.value.grad
-        # 如果之前value中没有记录梯度，直接clone，否则对梯度进行累加
-        self.value.grad = (
-            grad_out.clone() if previous is None else _dispatch.call_backend("add", previous, grad_out)
-        )
+        self.value.grad = grad_out.clone() if previous is None else previous + grad_out
         return ()
 
 
@@ -146,15 +175,15 @@ class InnerNode(Node):
     def __init__(
         self,
         edge: list[Node | None],
-        backrule: Callable[[_Meta], tuple[_Meta, ...]],
-        data: dict[str, _Meta] | None = None,
+        backrule: Callable[[Value], tuple[Value, ...]],
+        data: dict[str, Value] | None = None,
         name: str = "InnerNode",
     ) -> None:
         super().__init__(edge=edge, name=name)
         self.backrule = backrule
         self.data = {} if data is None else data
 
-    def apply(self, grad_out: _Meta) -> tuple[_Meta, ...]:
+    def apply(self, grad_out: Value) -> tuple[Value, ...]:
         return self.backrule(grad_out)
 
 
@@ -170,7 +199,7 @@ class Value:
             raise ValueError("关闭梯度的 Value 不应关联反向节点")
         self.meta = meta
         self.name = name
-        self.grad: _Meta | None = None
+        self.grad: Value | None = None
         self.require_grad = require_grad
         self.node = node
         if require_grad and node is None:
@@ -205,41 +234,62 @@ class Value:
     def __matmul__(self, other: Value) -> Value:
         return _dispatch.call("matmul", self, other)
 
-    def backward(self, seed: _Meta | None = None) -> None:
-        backward(self, seed)
+    def clone(self) -> Value:
+        return _dispatch.call("clone", self)
+
+    def transpose(self) -> Value:
+        return _dispatch.call("transpose", self)
+
+    # 可以直接使用.T进行矩阵转置运算
+    @property
+    def T(self) -> Value:
+        return self.transpose()
+
+    # create_graph 表示是否在反向计算过程中再次构造反向计算图
+    def backward(
+        self, seed: Value | _Meta | None = None, *, create_graph: bool = False
+    ) -> None:
+        backward(self, seed, create_graph=create_graph)
+
+    def __repr__(self) -> str:
+        return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
 
 
 class Autograd:
-    """独立的算子处理层：记录求导信息，再把同一个算子继续派发下去。
-
-    这里负责前向时建立反向图；
-    AutogradEngine 负责 backward 时执行图。
-    两者不是同一个组件。本版仍没有全局 grad mode 和高阶求导。
-    """
+    """前向和反向的 Value 运算共用此层，是否建图由当前梯度模式决定。"""
 
     def __init__(self, dispatcher: Dispatch) -> None:
         self.dispatcher = dispatcher
 
+    # excluded表示需要排除的处理流程
     def apply(
-        self, op: str, x: Value, y: Value | float, excluded: frozenset[str]
+        self, op: str, x: Value, y: Value | float | None, excluded: frozenset[str]
     ) -> Value:
-        # 如果y是value，那么y需不需要梯度取决于y.require_grad
-        # 如果y不是value，那么y不需要梯度
+        # 只有value类型可能需要梯度，纯数值不关联梯度信息
         other_requires_grad = y.require_grad if isinstance(y, Value) else False
-        require_grad = x.require_grad or other_requires_grad
+        # 查询当前上下文是否开启了梯度记录。
+        require_grad = is_grad_enabled() and (x.require_grad or other_requires_grad)
         node: Node | None = None
-        # 具体的回调函数是dispatch中的call_backend  
-        raw = self.dispatcher.call_backend
+        if self.dispatcher.trace:
+            print(f"  Autograd: grad_enabled={is_grad_enabled()}, record={require_grad}")
 
-        # 如果不需要梯度，直接redispatch，然后返回新创建的value结点，里面关联了node
         if require_grad:
-            if op == "scale":
+            if op == "clone":
+                node = InnerNode(
+                    [x.node], lambda grad_out: (grad_out,),
+                    name=f"CloneBackward({x.name})",
+                )
+            elif op == "transpose":
+                node = InnerNode(
+                    [x.node], lambda grad_out: (grad_out.T,),
+                    name=f"TransposeBackward({x.name})",
+                )
+            elif op == "scale":
                 if not isinstance(y, float):
                     raise TypeError("scale 的第二个参数必须是 float")
                 scalar = y
                 node = InnerNode(
-                    [x.node],
-                    lambda grad_out: (raw("scale", grad_out, scalar),),
+                    [x.node], lambda grad_out: (grad_out * scalar,),
                     name=f"ScaleBackward({x.name}, {scalar})",
                 )
             else:
@@ -253,25 +303,21 @@ class Autograd:
                     )
                 elif op == "sub":
                     node = InnerNode(
-                        edges,
-                        lambda grad_out: (grad_out, raw("scale", grad_out, -1.0)),
+                        edges, lambda grad_out: (grad_out, grad_out * -1.0),
                         name=f"SubBackward({x.name}, {y.name})",
                     )
                 elif op in ("mul", "matmul"):
-                    saved = {"left": x.meta.clone(), "right": y.meta.clone()}
+                    # 保留前向快照，同时保留它到原输入的求导关系。
+                    # x.meta.clone() 只有数值；x.clone() 则通过 CloneBackward 连接 x。
+                    # 这是教学策略；真实 PyTorch 通常保存张量并做版本检查。
+                    saved = {"left": x.clone(), "right": y.clone()}
                     if op == "mul":
-                        def mul_backward(grad_out: _Meta) -> tuple[_Meta, ...]:
-                            return (
-                                raw("mul", grad_out, saved["right"]),
-                                raw("mul", grad_out, saved["left"]),
-                            )
+                        def mul_backward(grad_out: Value) -> tuple[Value, ...]:
+                            return (grad_out * saved["right"], grad_out * saved["left"])
                         backrule = mul_backward
                     else:
-                        def matmul_backward(grad_out: _Meta) -> tuple[_Meta, ...]:
-                            return (
-                                raw("matmul", grad_out, raw("transpose", saved["right"])),
-                                raw("matmul", raw("transpose", saved["left"]), grad_out),
-                            )
+                        def matmul_backward(grad_out: Value) -> tuple[Value, ...]:
+                            return (grad_out @ saved["right"].T, saved["left"].T @ grad_out)
                         backrule = matmul_backward
                     node = InnerNode(
                         edges, backrule, data=saved,
@@ -280,44 +326,38 @@ class Autograd:
                 else:
                     raise NotImplementedError(f"缺少 {op} 的反向规则")
 
-        # 再次派发同一个 op，显式排除本层，避免重新选中 Autograd。
-        # 输入仍是 Value，requires_grad 也不变；排除的是处理层，而非输入信息。
+        # 排除 Autograd 只影响本次算子的后续派发，不改变当前梯度模式。
         result = self.dispatcher.redispatch(op, x, y, exclude=excluded | {"Autograd"})
         return Value(result.meta, result.name, require_grad, node)
 
 
 class Dispatch:
-    """最小的两层 Dispatcher：Autograd 的优先级高于 CPU。
-
-    call/redispatch 接收 Value，按处理层选择实现。
-    call_backend 接收 _Meta，查找 CPU 算子实现，供 CPU 层和原始梯度计算使用。
-    本例固定只有 CPU，不从 Tensor 派发键或线程局部状态提取 key。
-    """
+    """前向和反向的 Value 运算都经过同一套 Autograd → CPU 派发。"""
 
     def __init__(self, *, trace: bool = False) -> None:
         cpu = CPUBackend()
         self.trace = trace
-        # 算子名与具体 CPU 实现分离；新增设备时需要扩展这张表及选择逻辑。
         self.cpu_kernels: dict[str, Callable[..., _Meta]] = {
             "add": cpu.add, "sub": cpu.sub, "mul": cpu.mul,
-            "scale": cpu.scale, "matmul": cpu.matmul, "transpose": cpu.transpose,
+            "scale": cpu.scale, "matmul": cpu.matmul,
+            "transpose": cpu.transpose, "clone": cpu.clone,
         }
         self.autograd = Autograd(self)
         self.layers: dict[
-            str, Callable[[str, Value, Value | float, frozenset[str]], Value]
+            str, Callable[[str, Value, Value | float | None, frozenset[str]], Value]
         ] = {
             "Autograd": self.autograd.apply,
-            "CPU": self._cpu,
+            "CPU": self._cpu_value_adapter,
         }
         self.priority = ("Autograd", "CPU")
 
-    def call(self, op: str, x: Value, y: Value | float) -> Value:
+    def call(self, op: str, x: Value, y: Value | float | None = None) -> Value:
         return self.redispatch(op, x, y, exclude=frozenset())
 
     def redispatch(
-        self, op: str, x: Value, y: Value | float, *, exclude: frozenset[str]
+        self, op: str, x: Value, y: Value | float | None = None, *, exclude: frozenset[str]
     ) -> Value:
-        if op not in self.cpu_kernels or op == "transpose":
+        if op not in self.cpu_kernels:
             raise NotImplementedError(f"不支持 Value 算子 {op}")
         for key in self.priority:
             if key not in exclude:
@@ -326,26 +366,25 @@ class Dispatch:
                 return self.layers[key](op, x, y, exclude)
         raise RuntimeError(f"{op} 没有可用处理层，已排除 {sorted(exclude)}")
 
-    def _cpu(
-        self, op: str, x: Value, y: Value | float, excluded: frozenset[str]
+    def _cpu_value_adapter(
+        self, op: str, x: Value, y: Value | float | None, excluded: frozenset[str]
     ) -> Value:
         argument = y.meta if isinstance(y, Value) else y
-        result = self.call_backend(op, x.meta, argument)
+        result = self.call_cpu_kernel(op, x.meta, argument)
         label = y.name if isinstance(y, Value) else str(y)
-        # CPU 层只包装数值，反向节点由外层 Autograd 关联。
-        return Value(result, name=f"{op}({x.name}, {label})", require_grad=False)
+        name = f"{op}({x.name})" if y is None else f"{op}({x.name}, {label})"
+        return Value(result, name=name, require_grad=False)
 
-    # call_backend现在接受的参数只能是底层的meta，
-    def call_backend(self, op: str, x: _Meta, y: _Meta | float | None = None) -> _Meta:
-        """直接选择 CPU 数值实现，不记录反向图；梯度尚未升级为 Value。"""
+    def call_cpu_kernel(self, op: str, x: _Meta, y: _Meta | float | None = None) -> _Meta:
+        """仅负责调用 CPU 数值实现；不是反向规则的直接入口。"""
         kernel = self.cpu_kernels.get(op)
         if kernel is None:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.trace:
             print(f"  CPU kernel: {op}")
-        if op == "transpose":
+        if op in ("transpose", "clone"):
             if y is not None:
-                raise TypeError("transpose 只接受一个张量")
+                raise TypeError(f"{op} 只接受一个张量")
             return kernel(x)
         if op == "scale":
             if not isinstance(y, (int, float)):
@@ -361,21 +400,21 @@ _dispatch = Dispatch()
 class AutogradEngine:
     """梯度收齐后统一调用 Node.apply；梯度缓冲区属于本次反向任务。"""
 
-    def run_backward(self, output: Node, seed: _Meta) -> None:
-        nodes = self._collect_nodes(output)
-        pending = self._compute_dependencies(nodes)
-        # 不预填 0.0：每个节点的梯度是不同形状的张量，首份贡献直接复制。
-        grad_buffers: dict[Node, _Meta] = {output: seed.clone()}
-        ready: deque[Node] = deque([output])
-
-        print("\n=== 反向前：等待的梯度贡献数 ===")
-        for node in nodes:
-            print(f"{node.name}: {pending[node]} 份")
-
-        while ready:
-            node = ready.popleft()
-            grad_out = grad_buffers.pop(node)
-            self._evaluate_function(node, grad_out, pending, grad_buffers, ready)
+    def run_backward(self, output: Node, seed: Value, *, create_graph: bool = False) -> None:
+        # 默认反向临时关闭建图；create_graph=True 则临时开启。
+        # 无论调用者外面的梯度模式是什么，退出后都会恢复。
+        with set_grad_enabled(create_graph):
+            nodes = self._collect_nodes(output)
+            pending = self._compute_dependencies(nodes)
+            grad_buffers: dict[Node, Value] = {output: seed}
+            ready: deque[Node] = deque([output])
+            print(f"\n=== Engine：create_graph={create_graph} ===")
+            for node in nodes:
+                print(f"{node.name}: 等待 {pending[node]} 份梯度")
+            while ready:
+                node = ready.popleft()
+                grad_out = grad_buffers.pop(node)
+                self._evaluate_function(node, grad_out, pending, grad_buffers, ready)
 
     def _collect_nodes(self, output: Node) -> list[Node]:
         nodes: list[Node] = []
@@ -401,9 +440,9 @@ class AutogradEngine:
     def _evaluate_function(
         self,
         node: Node,
-        grad_out: _Meta,
+        grad_out: Value,
         pending: dict[Node, int],
-        grad_buffers: dict[Node, _Meta],
+        grad_buffers: dict[Node, Value],
         ready: deque[Node],
     ) -> None:
         print(f"\n执行 {node.name}：上游梯度 {grad_out}")
@@ -415,9 +454,7 @@ class AutogradEngine:
                 continue
             previous = grad_buffers.get(edge)
             grad_buffers[edge] = (
-                contribution.clone()
-                if previous is None
-                else _dispatch.call_backend("add", previous, contribution)
+                contribution if previous is None else previous + contribution
             )
             pending[edge] -= 1
             print(
@@ -431,16 +468,21 @@ class AutogradEngine:
 _engine = AutogradEngine()
 
 
-def backward(output: Value, seed: _Meta | None = None) -> None:
+def backward(
+    output: Value, seed: Value | _Meta | None = None, *, create_graph: bool = False
+) -> None:
     if not output.require_grad or output.node is None:
         raise RuntimeError("当前 Value 没有可用的反向入口")
     if seed is None:
         if output.meta.numel != 1:
             raise ValueError("多元素输出必须显式提供同形状的上游梯度 seed")
-        seed = _Meta.ones_like(output.meta)
+        seed = Value(_Meta.ones_like(output.meta), name="seed", require_grad=False)
+    elif isinstance(seed, _Meta):
+        # 兼容旧示例中的 _Meta seed；它被包装为不需要梯度的 Value。
+        seed = Value(seed, name="seed", require_grad=False)
     if seed.shape != output.shape:
         raise ValueError(f"seed.shape={seed.shape} 与输出形状 {output.shape} 不一致")
-    _engine.run_backward(output.node, seed)
+    _engine.run_backward(output.node, seed, create_graph=create_graph)
 
 
 class module:
@@ -468,18 +510,33 @@ class myModulde(module):
 
 
 def main() -> None:
-    print("=== 前向：矩阵乘法与数乘 ===")
-    _dispatch.trace = True  # 显示前向与反向的派发路径。
+    _dispatch.trace = True
+    print("=== 1. 原来的矩阵示例：普通 backward 不记录梯度计算 ===")
     model = myModulde("m1")
     input = Value(_Meta([1, 2], [1, 2]), name="input", require_grad=False)
     output = model(input)
-    print("output:", output.meta)
-    # 用全 1 的上游梯度，表示对所有输出元素之和求导。
-    output.backward(_Meta.ones_like(output.meta))
-    print("\n=== 结果 ===")
-    print("input.grad:", input.grad)
+    print("output:", output)
+    output.backward(Value(_Meta.ones_like(output.meta), require_grad=False))
     print("x.grad:", model.x.grad)
     print("y.grad:", model.y.grad)
+
+    print("\n=== 2. no_grad 临时关闭建图，不修改输入 require_grad ===")
+    x = Value(_Meta([2], []), name="x")
+    with no_grad():
+        frozen_output = x * x
+        print("no_grad 内的输出:", frozen_output)
+    print("退出后 grad_enabled:", is_grad_enabled())
+    print("原输入 require_grad:", x.require_grad)
+
+    print("\n=== 3. y=x³：在 x=2 处求一阶和二阶导数 ===")
+    y = x * x * x
+    y.backward(create_graph=True)
+    first = x.grad
+    assert first is not None
+    print("一阶导数:", first)  # 3x² = 12，并关联新的反向图。
+    x.grad = None  # 清空累加结果，避免把一阶、二阶导数加到一起。
+    first.backward()
+    print("二阶导数:", x.grad)  # 6x = 12，普通 backward 的结果不继续建图。
 
 
 if __name__ == "__main__":
