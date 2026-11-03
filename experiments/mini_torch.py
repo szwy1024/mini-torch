@@ -1,7 +1,7 @@
-"""学习阶段 10：sum、expand、reshape 和不可变算子配置。
+"""学习阶段 11：exp 与 ReLU 非线性算子。
 
 运行：python experiments/mini_torch.py
-补建说明：pytorch10.py 原稿未完成；使用当时补齐并验证的 sum/expand 版本恢复可运行阶段。
+补建说明：源自 pytorch11.py；保留已修复的 exp 与 ReLU 掩码规则，缩短演示循环。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from math import prod
+from math import exp
 from typing import Callable, Generator, Sequence
 from typing import Iterator
 
@@ -111,7 +112,7 @@ def _check_size(size: int) -> None:
 def _check_shape(shape: Sequence[int]) -> tuple[int, ...]:
     result = tuple(shape)
     if any(type(dim) is not int or dim < 0 for dim in result):
-        raise ValueError("shape 必须由非负整数组成；暂不支持 -1 推断")
+        raise ValueError("shape 必须由非负整数组成")
     return result
 
 
@@ -206,17 +207,21 @@ class CPUBackend(Backend):
             return x.clone()
         outer = prod(x.shape[:dim])
         reduce_size = x.shape[dim]
-        inner = prod(x.shape[dim + 1:])
+        inner = prod(x.shape[dim + 1 :])
         result: list[float] = []
         for outer_index in range(outer):
             for inner_index in range(inner):
                 total = 0.0
                 for reduce_index in range(reduce_size):
-                    offset = outer_index * reduce_size * inner + reduce_index * inner + inner_index
+                    offset = (
+                        outer_index * reduce_size * inner
+                        + reduce_index * inner
+                        + inner_index
+                    )
                     total += x.data[offset]
                 result.append(total)
         middle = (1,) if keepdim else ()
-        shape = x.shape[:dim] + middle + x.shape[dim + 1:]
+        shape = x.shape[:dim] + middle + x.shape[dim + 1 :]
         return _Meta(result, shape)
 
     def expand(self, x: _Meta, dim: int, size: int) -> _Meta:
@@ -231,7 +236,7 @@ class CPUBackend(Backend):
         inner = prod(x.shape[dim:])
         result: list[float] = []
         for outer_index in range(outer):
-            block = x.data[outer_index * inner:(outer_index + 1) * inner]
+            block = x.data[outer_index * inner : (outer_index + 1) * inner]
             for _ in range(size):
                 result.extend(block)
         return _Meta(result, x.shape[:dim] + (size,) + x.shape[dim:])
@@ -242,6 +247,12 @@ class CPUBackend(Backend):
         if prod(target) != x.numel:
             raise ValueError(f"reshape 元素数不匹配：{x.shape} → {target}")
         return _Meta(x.data, target)
+
+    def exponential(self, x: _Meta) -> _Meta:
+        return _Meta([exp(data) for data in x.data], x.shape)
+
+    def relu(self, x: _Meta) -> _Meta:
+        return _Meta([max(data, 0) for data in x.data], x.shape)
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {
@@ -255,6 +266,8 @@ class CPUBackend(Backend):
             "sum": self.sum,
             "expand": self.expand,
             "reshape": self.reshape,
+            "exponential": self.exponential,
+            "relu":self.relu,
         }
 
 
@@ -382,6 +395,15 @@ class Value:
     def reshape(self, shape: Sequence[int]) -> Value:
         return _dispatch.call("reshape", self, shape=shape)
 
+    def exp(self) -> Value:
+        return self.exponential()
+
+    def exponential(self) -> Value:
+        return _dispatch.call("exponential", self)
+
+    def relu(self) ->Value:
+        return _dispatch.call("relu",self)
+
     # 可以直接使用.T进行矩阵转置运算
     @property
     def T(self) -> Value:
@@ -439,6 +461,25 @@ class Autograd:
                     lambda grad_out: (grad_out.T,),
                     name=f"TransposeBackward({x.name})",
                 )
+            elif op == "exponential":
+                saved = {"save": x.clone()}
+                node = InnerNode(
+                    [x.node],
+                    lambda grad_out: (grad_out * saved["save"].exp(),),
+                    name=f"ExpBackward({x.name})",
+                )
+            elif op == "relu":
+                mask = Value(
+                    _Meta([1.0 if  value >0 else 0.0 for value in x.data],x.shape),
+                    name = f"ReluMask({x.name})",
+                    require_grad= False
+                    )
+                node = InnerNode(
+                    [x.node],
+                    lambda grad_out: (grad_out * mask,),
+                    data= {"mask":mask},
+                    name=f"ReluBackward({x.name})",
+                )
             elif op == "scale":
                 if not isinstance(y, float):
                     raise TypeError("scale 的第二个参数必须是 float")
@@ -452,39 +493,50 @@ class Autograd:
                 input_shape = x.shape
                 axis = options.dim
                 if axis is None:
+
                     def sum_all_backward(grad_out: Value) -> tuple[Value, ...]:
                         result = grad_out.reshape(())
                         for insert_axis, length in enumerate(input_shape):
                             result = result.expand(insert_axis, length)
                         return (result,)
-                    node = InnerNode([x.node], sum_all_backward, name=f"SumBackward({x.name})")
+
+                    node = InnerNode(
+                        [x.node], sum_all_backward, name=f"SumBackward({x.name})"
+                    )
                 elif x.meta.ndim == 0:
                     node = InnerNode(
-                        [x.node], lambda grad_out: (grad_out.reshape(()),),
+                        [x.node],
+                        lambda grad_out: (grad_out,),
                         name=f"SumBackward({x.name})",
                     )
                 else:
                     sum_axis = axis
-                    reduced_shape = input_shape[:sum_axis] + input_shape[sum_axis + 1:]
+                    reduced_shape = input_shape[:sum_axis] + input_shape[sum_axis + 1 :]
                     reduce_size = input_shape[sum_axis]
+
                     def sum_axis_backward(grad_out: Value) -> tuple[Value, ...]:
                         # keepdim=True 时先去掉长度为 1 的归约轴，再插入复制。
                         gradient = grad_out.reshape(reduced_shape)
                         return (gradient.expand(sum_axis, reduce_size),)
-                    node = InnerNode([x.node], sum_axis_backward, name=f"SumBackward({x.name})")
+
+                    node = InnerNode(
+                        [x.node], sum_axis_backward, name=f"SumBackward({x.name})"
+                    )
             elif op == "expand":
                 expand_axis = options.dim
                 if expand_axis is None:
                     raise RuntimeError("expand 缺少已验证的 dim")
                 # 前向插入复制的是新轴，反向将其求和并删除，恢复原形状。
                 node = InnerNode(
-                    [x.node], lambda grad_out: (grad_out.sum(expand_axis),),
+                    [x.node],
+                    lambda grad_out: (grad_out.sum(expand_axis),),
                     name=f"ExpandBackward({x.name})",
                 )
             elif op == "reshape":
                 original_shape = x.shape
                 node = InnerNode(
-                    [x.node], lambda grad_out: (grad_out.reshape(original_shape),),
+                    [x.node],
+                    lambda grad_out: (grad_out.reshape(original_shape),),
                     name=f"ReshapeBackward({x.name})",
                 )
 
@@ -551,8 +603,12 @@ class ExecuteLayer:
         }
 
     def apply(
-        self, op: str, x: Value, y: Value | float | None,
-        options: OpOptions, excluded: frozenset[str],
+        self,
+        op: str,
+        x: Value,
+        y: Value | float | None,
+        options: OpOptions,
+        excluded: frozenset[str],
     ) -> Value:
         argument = y.meta if isinstance(y, Value) else y
         result = self.call_kernel(op, x.meta, argument, options=options)
@@ -573,7 +629,7 @@ class ExecuteLayer:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
-        if op in ("transpose", "clone"):
+        if op in ("transpose", "clone", "exponential","relu"):
             return kernel(x)
         if op == "sum":
             return kernel(x, options.dim, keepdim=options.keepdim)
@@ -592,15 +648,30 @@ class Dispatch:
 
     def __init__(self, *, _trace: bool = False) -> None:
         self._trace = _trace
-        self.operator = frozenset({
-            "add", "sub", "mul", "scale", "matmul", "transpose", "clone",
-            "sum", "expand", "reshape",
-        })
+        self.operator = frozenset(
+            {
+                "add",
+                "sub",
+                "mul",
+                "scale",
+                "matmul",
+                "transpose",
+                "clone",
+                "sum",
+                "expand",
+                "reshape",
+                "exponential",
+                "relu",
+            }
+        )
         self.autograd = Autograd(self)
         self.executeLayer = ExecuteLayer(self)
         self.kernels = self.executeLayer.get_kernels()
         self.layers: dict[
-            str, Callable[[str, Value, Value | float | None, OpOptions, frozenset[str]], Value]
+            str,
+            Callable[
+                [str, Value, Value | float | None, OpOptions, frozenset[str]], Value
+            ],
         ] = {
             "Autograd": self.autograd.apply,
             "CPU": self.executeLayer.apply,
@@ -608,8 +679,14 @@ class Dispatch:
         self.priority = ("Autograd", "CPU")
 
     def call(
-        self, op: str, x: Value, y: Value | float | None = None, *,
-        dim: int | None = None, size: int | None = None, keepdim: bool = False,
+        self,
+        op: str,
+        x: Value,
+        y: Value | float | None = None,
+        *,
+        dim: int | None = None,
+        size: int | None = None,
+        keepdim: bool = False,
         shape: Sequence[int] | None = None,
     ) -> Value:
         if op not in self.operator:
@@ -627,7 +704,7 @@ class Dispatch:
         if op != "reshape" and shape is not None:
             raise TypeError(f"{op} 不接受 shape")
 
-        unary = {"transpose", "clone", "sum", "expand", "reshape"}
+        unary = {"transpose", "clone", "sum", "expand", "reshape", "exponential","relu"}
         if op in unary:
             if y is not None:
                 raise TypeError(f"{op} 只接受一个 Value；dim/size 等配置请使用关键字")
@@ -658,8 +735,13 @@ class Dispatch:
         return self.redispatch(op, x, y, options=options, exclude=frozenset())
 
     def redispatch(
-        self, op: str, x: Value, y: Value | float | None = None, *,
-        options: OpOptions, exclude: frozenset[str],
+        self,
+        op: str,
+        x: Value,
+        y: Value | float | None = None,
+        *,
+        options: OpOptions,
+        exclude: frozenset[str],
     ) -> Value:
         if op not in self.operator:
             raise NotImplementedError(f"不支持 Value 算子 {op}")
@@ -851,30 +933,23 @@ class module:
 class myModulde(module):
     def __init__(self, name: str) -> None:
         super().__init__(name)
-        self.x = Parameter(_Meta([1, 2, 3, 4, 5, 6], [2, 3]), name="x")
-        self.y = Parameter(_Meta([2, 3, 4, 5, 6, 7], [3, 2]), name="y")
+        self.x = Parameter(_Meta([1, 2, -3, -4, 5, -6], [2, 3]), name="x")
+        self.y = Parameter(_Meta([2, -3, 4, 5, -6, 7], [3, 2]), name="y")
 
     def forward(self, input: Value) -> Value:
         # (1,2) @ (2,3) @ (3,2) → (1,2)，随后对整个矩阵数乘。
         self.hidden1 = input @ self.x
-        self.hidden2 = (self.hidden1 @ self.y) * 0.5
-        return self.hidden2 @ self.hidden2.T
+        self.hidden2 = self.hidden1.relu()
+        self.hidden3 = (self.hidden2 @ self.y) * 0.5
+        self.hidden4 = self.hidden3.relu()
+        return self.hidden4 @ self.hidden4.T
 
 
 def main() -> None:
     _dispatch._trace = False
 
-    print("=== sum / expand 示例 ===")
-    x = Value(_Meta([1, 2, 3, 4, 5, 6], (2, 3)), name="x")
-    row_sum = x.sum(dim=1)
-    print("删除归约维：", row_sum)
-    print("保留归约维：", x.sum(dim=-1, keepdim=True))
-    print("插入并复制维度：", row_sum.expand(dim=1, size=3))
-    row_sum.backward(Value(_Meta([2, 3], (2,)), require_grad=False))
-    print("x.grad：", x.grad)  # [[2,2,2], [3,3,3]]
-
-    z = Value(_Meta([1, 2, 3, 4, 5, 6], (2, 3)), name="z")
-    loss = (z * z).sum()
+    z = Value(_Meta([1, -2, 3, -4, -5, 6], (2, 3)), name="z")
+    loss = (z * z).relu().sum()
     loss.backward(create_graph=True)
     first = z.grad
     assert first is not None
