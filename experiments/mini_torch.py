@@ -1,7 +1,7 @@
-"""学习阶段 07：梯度模式与可继续求导的 Value 梯度。
+"""学习阶段 08：将数值执行层和 backend 注册解耦。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch7.py；no_grad、create_graph 与高阶求导。
+补建说明：源自 pytorch8.py；GPU 仍为占位，CPU 派发不再被 GPU 同名占位函数覆盖。
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from collections import deque
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from math import prod
-from typing import Callable,Generator, Sequence
+from typing import Callable, Generator, Sequence
 
 
 # ContextVar 保存当前执行上下文的状态，嵌套或异常退出时用 token 恢复。
@@ -85,14 +85,21 @@ class _Meta:
     def __repr__(self) -> str:
         return f"_Meta(data={self.data}, shape={self.shape})"
 
+class Backend:
+        def __init__(self,name:str):
+            self.name = name
 
-class CPUBackend:
+
+class CPUBackend(Backend):
     """CPU 数值实现：只处理 _Meta，不创建反向节点。"""
 
     @staticmethod
     def _check_same_shape(x: _Meta, y: _Meta) -> None:
         if x.shape != y.shape:
             raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
+
+    def __init__(self, name: str):
+        super().__init__(name)
 
     def add(self, x: _Meta, y: _Meta) -> _Meta:
         self._check_same_shape(x, y)
@@ -142,7 +149,32 @@ class CPUBackend:
             (cols, rows),
         )
 
+    def get_ability(self)->dict[str,Callable[...,_Meta]]:
+        return {
+                                    "add": self.add, "sub": self.sub, "mul": self.mul,
+                                    "scale": self.scale, "matmul": self.matmul,
+                                    "transpose": self.transpose, "clone": self.clone,
+                                }
 
+
+class GPUBackend(Backend):
+    @staticmethod
+    def _check_same_shape(x: _Meta, y: _Meta) -> None:
+        if x.shape != y.shape:
+            raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
+    
+    def __init__(self, name: str):
+        super().__init__(name)
+
+    # ?这里还是普通的加法，我准备后期使用Metal框架实现向量加法
+    def add(self, x: _Meta, y: _Meta) -> _Meta:
+        self._check_same_shape(x, y)
+        return _Meta([a + b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+
+    def get_ability(self)->dict[str,Callable[...,_Meta]]:
+        return {"add": self.add}
+
+    
 class Node:
     """反向规则的输入、输出现在都是 Value，可以继续参与自动微分。"""
 
@@ -247,7 +279,7 @@ class Value:
 
     # create_graph 表示是否在反向计算过程中再次构造反向计算图
     def backward(
-        self, seed: Value | _Meta | None = None, *, create_graph: bool = False
+        self, seed: Value | None = None, *, create_graph: bool = False
     ) -> None:
         backward(self, seed, create_graph=create_graph)
 
@@ -267,7 +299,7 @@ class Autograd:
     ) -> Value:
         # 只有value类型可能需要梯度，纯数值不关联梯度信息
         other_requires_grad = y.require_grad if isinstance(y, Value) else False
-        # 查询当前上下文是否开启了梯度记录。
+        # 查询当前上下文是否开启了梯度。
         require_grad = is_grad_enabled() and (x.require_grad or other_requires_grad)
         node: Node | None = None
         if self.dispatcher.trace:
@@ -331,56 +363,31 @@ class Autograd:
         return Value(result.meta, result.name, require_grad, node)
 
 
-class Dispatch:
-    """前向和反向的 Value 运算都经过同一套 Autograd → CPU 派发。"""
-
-    def __init__(self, *, trace: bool = False) -> None:
-        cpu = CPUBackend()
-        self.trace = trace
-        self.cpu_kernels: dict[str, Callable[..., _Meta]] = {
-            "add": cpu.add, "sub": cpu.sub, "mul": cpu.mul,
-            "scale": cpu.scale, "matmul": cpu.matmul,
-            "transpose": cpu.transpose, "clone": cpu.clone,
-        }
-        self.autograd = Autograd(self)
-        self.layers: dict[
-            str, Callable[[str, Value, Value | float | None, frozenset[str]], Value]
-        ] = {
-            "Autograd": self.autograd.apply,
-            "CPU": self._cpu_value_adapter,
-        }
-        self.priority = ("Autograd", "CPU")
-
-    def call(self, op: str, x: Value, y: Value | float | None = None) -> Value:
-        return self.redispatch(op, x, y, exclude=frozenset())
-
-    def redispatch(
-        self, op: str, x: Value, y: Value | float | None = None, *, exclude: frozenset[str]
-    ) -> Value:
-        if op not in self.cpu_kernels:
-            raise NotImplementedError(f"不支持 Value 算子 {op}")
-        for key in self.priority:
-            if key not in exclude:
-                if self.trace:
-                    print(f"Dispatcher: {op} → {key}；排除 {sorted(exclude)}")
-                return self.layers[key](op, x, y, exclude)
-        raise RuntimeError(f"{op} 没有可用处理层，已排除 {sorted(exclude)}")
-
-    def _cpu_value_adapter(
-        self, op: str, x: Value, y: Value | float | None, excluded: frozenset[str]
-    ) -> Value:
-        argument = y.meta if isinstance(y, Value) else y
-        result = self.call_cpu_kernel(op, x.meta, argument)
-        label = y.name if isinstance(y, Value) else str(y)
-        name = f"{op}({x.name})" if y is None else f"{op}({x.name}, {label})"
-        return Value(result, name=name, require_grad=False)
-
-    def call_cpu_kernel(self, op: str, x: _Meta, y: _Meta | float | None = None) -> _Meta:
-        """仅负责调用 CPU 数值实现；不是反向规则的直接入口。"""
-        kernel = self.cpu_kernels.get(op)
+class ExecuteLayer:
+    def __init__(self,dispatcher:Dispatch):
+        self.dispatcher = dispatcher
+        cpu = CPUBackend("cpu")
+        gpu = GPUBackend("gpu")
+        # ?这里的实现逻辑有点问题，我觉得以后应该在这个类初始化时
+        # ?遍历所有继承自Backend的类，然后调用其中的get_ability方法，进行注册
+        # ?这里的调度没有区分优先级，我觉得应该有优先级，GPU的调度优先级高于CPU，不过我还没想好如何表示
+        self.kernels: dict[str, Callable[..., _Meta]] = cpu.get_ability()
+                                
+    def apply(
+            self, op: str, x: Value, y: Value | float | None, excluded: frozenset[str]
+        ) -> Value:
+            argument = y.meta if isinstance(y, Value) else y
+            result = self.call_kernel(op, x.meta, argument)
+            label = y.name if isinstance(y, Value) else str(y)
+            name = f"{op}({x.name})" if y is None else f"{op}({x.name}, {label})"
+            return Value(result, name=name, require_grad=False)
+    
+    def call_kernel(self, op: str, x: _Meta, y: _Meta | float | None = None) -> _Meta:
+        """仅负责调用backend数值实现；不是反向规则的直接入口。"""
+        kernel = self.kernels.get(op)
         if kernel is None:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
-        if self.trace:
+        if self.dispatcher.trace:
             print(f"  CPU kernel: {op}")
         if op in ("transpose", "clone"):
             if y is not None:
@@ -393,7 +400,44 @@ class Dispatch:
             raise TypeError(f"{op} 需要两个 _Meta 张量")
         return kernel(x, y)
 
+    def get_kernels(self)->dict[str,Callable[...,_Meta]]:
+        return self.kernels
 
+
+class Dispatch:
+    """前向和反向的 Value 运算都经过同一套 Autograd → CPU 派发。"""
+
+    def __init__(self, *, trace: bool = False) -> None:
+        self.trace = trace
+        #目前支持的算子操作
+        self.operator = ( "add", "sub", "mul", "scale", "matmul","transpose", "clone")
+        self.autograd = Autograd(self)
+        self.executeLayer = ExecuteLayer(self)
+        self.kernels: dict[str, Callable[..., _Meta]] = self.executeLayer.get_kernels()
+        self.layers: dict[
+            str, Callable[[str, Value, Value | float | None, frozenset[str]], Value]
+        ] = {
+            "Autograd": self.autograd.apply,
+            "CPU": self.executeLayer.apply,
+        }
+        self.priority = ("Autograd", "CPU")
+
+    def call(self, op: str, x: Value, y: Value | float | None = None) -> Value:
+        return self.redispatch(op, x, y, exclude=frozenset())
+
+    def redispatch(
+        self, op: str, x: Value, y: Value | float | None = None, *, exclude: frozenset[str]
+    ) -> Value:
+        if op not in self.operator:
+            raise NotImplementedError(f"不支持 Value 算子 {op}")
+        for key in self.priority:
+            if key not in exclude:
+                if self.trace:
+                    print(f"Dispatcher: {op} → {key}；排除 {sorted(exclude)}")
+                return self.layers[key](op, x, y, exclude)
+        raise RuntimeError(f"{op} 没有可用处理层，已排除 {sorted(exclude)}")
+
+    
 _dispatch = Dispatch()
 
 
@@ -469,7 +513,7 @@ _engine = AutogradEngine()
 
 
 def backward(
-    output: Value, seed: Value | _Meta | None = None, *, create_graph: bool = False
+    output: Value, seed: Value | None = None, *, create_graph: bool = False
 ) -> None:
     if not output.require_grad or output.node is None:
         raise RuntimeError("当前 Value 没有可用的反向入口")
@@ -477,9 +521,8 @@ def backward(
         if output.meta.numel != 1:
             raise ValueError("多元素输出必须显式提供同形状的上游梯度 seed")
         seed = Value(_Meta.ones_like(output.meta), name="seed", require_grad=False)
-    elif isinstance(seed, _Meta):
-        # 兼容旧示例中的 _Meta seed；它被包装为不需要梯度的 Value。
-        seed = Value(seed, name="seed", require_grad=False)
+    elif not isinstance(seed, Value):
+        raise TypeError("seed 必须是 Value；单元素输出可以省略 seed 或传入 None")
     if seed.shape != output.shape:
         raise ValueError(f"seed.shape={seed.shape} 与输出形状 {output.shape} 不一致")
     _engine.run_backward(output.node, seed, create_graph=create_graph)
