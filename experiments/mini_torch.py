@@ -1,7 +1,7 @@
-"""学习阶段 11：exp 与 ReLU 非线性算子。
+"""学习阶段 12：逐元素除法与自然对数。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch11.py；保留已修复的 exp 与 ReLU 掩码规则，缩短演示循环。
+补建说明：源自 pytorch12.py；含定义域检查与可继续求导的反向规则。
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from math import prod
-from math import exp
+from math import exp, log
 from typing import Callable, Generator, Sequence
 from typing import Iterator
 
@@ -116,6 +116,20 @@ def _check_shape(shape: Sequence[int]) -> tuple[int, ...]:
     return result
 
 
+def _check_div_inputs(x: _Meta, y: _Meta) -> None:
+    """当前除法不做广播；正零和负零都不允许作为分母。"""
+    if x.shape != y.shape:
+        raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
+    if any(value == 0.0 for value in y.data):
+        raise ZeroDivisionError("div 的分母不能包含零")
+
+
+def _check_log_input(x: _Meta) -> None:
+    """只接受实数正值；写成 not > 0 也会拒绝 NaN。"""
+    if any(not value > 0.0 for value in x.data):
+        raise ValueError("log 的输入必须逐元素大于零")
+
+
 @dataclass(frozen=True)
 class OpOptions:
     """在处理层之间传递不可变的算子配置；配置不参与梯度计算。"""
@@ -157,6 +171,16 @@ class CPUBackend(Backend):
         """逐元素乘法，区别于 matmul。"""
         self._check_same_shape(x, y)
         return _Meta([a * b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+
+    def div(self, x: _Meta, y: _Meta) -> _Meta:
+        """同形状逐元素相除；不执行矩阵求逆或广播。"""
+        _check_div_inputs(x, y)
+        return _Meta([a / b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+
+    def log(self, x: _Meta) -> _Meta:
+        """逐元素自然对数。"""
+        _check_log_input(x)
+        return _Meta([log(value) for value in x.data], x.shape)
 
     def scale(self, x: _Meta, scalar: float) -> _Meta:
         """矩阵或张量的数乘，scalar 是普通 Python 常数。"""
@@ -259,6 +283,8 @@ class CPUBackend(Backend):
             "add": self.add,
             "sub": self.sub,
             "mul": self.mul,
+            "div": self.div,
+            "log": self.log,
             "scale": self.scale,
             "matmul": self.matmul,
             "transpose": self.transpose,
@@ -267,7 +293,7 @@ class CPUBackend(Backend):
             "expand": self.expand,
             "reshape": self.reshape,
             "exponential": self.exponential,
-            "relu":self.relu,
+            "relu": self.relu,
         }
 
 
@@ -373,6 +399,10 @@ class Value:
             return _dispatch.call("scale", self, float(other))
         return _dispatch.call("mul", self, other)
 
+    def __truediv__(self, other: Value) -> Value:
+        """当前只支持两个同形状的 Value 相除。"""
+        return _dispatch.call("div", self, other)
+
     def __rmul__(self, scalar: float | int) -> Value:
         return self * scalar
 
@@ -398,11 +428,14 @@ class Value:
     def exp(self) -> Value:
         return self.exponential()
 
+    def log(self) -> Value:
+        return _dispatch.call("log", self)
+
     def exponential(self) -> Value:
         return _dispatch.call("exponential", self)
 
-    def relu(self) ->Value:
-        return _dispatch.call("relu",self)
+    def relu(self) -> Value:
+        return _dispatch.call("relu", self)
 
     # 可以直接使用.T进行矩阵转置运算
     @property
@@ -468,16 +501,24 @@ class Autograd:
                     lambda grad_out: (grad_out * saved["save"].exp(),),
                     name=f"ExpBackward({x.name})",
                 )
+            elif op == "log":
+                saved = {"input": x.clone()}
+                node = InnerNode(
+                    [x.node],
+                    lambda grad_out: (grad_out / saved["input"],),
+                    data=saved,
+                    name=f"LogBackward({x.name})",
+                )
             elif op == "relu":
                 mask = Value(
-                    _Meta([1.0 if  value >0 else 0.0 for value in x.data],x.shape),
-                    name = f"ReluMask({x.name})",
-                    require_grad= False
-                    )
+                    _Meta([1.0 if value > 0 else 0.0 for value in x.data], x.shape),
+                    name=f"ReluMask({x.name})",
+                    require_grad=False,
+                )
                 node = InnerNode(
                     [x.node],
                     lambda grad_out: (grad_out * mask,),
-                    data= {"mask":mask},
+                    data={"mask": mask},
                     name=f"ReluBackward({x.name})",
                 )
             elif op == "scale":
@@ -492,6 +533,7 @@ class Autograd:
             elif op == "sum":
                 input_shape = x.shape
                 axis = options.dim
+                # 如果axis为空，计算结果是标量
                 if axis is None:
 
                     def sum_all_backward(grad_out: Value) -> tuple[Value, ...]:
@@ -503,6 +545,7 @@ class Autograd:
                     node = InnerNode(
                         [x.node], sum_all_backward, name=f"SumBackward({x.name})"
                     )
+                # 如果x本身就是标量
                 elif x.meta.ndim == 0:
                     node = InnerNode(
                         [x.node],
@@ -556,10 +599,27 @@ class Autograd:
                         lambda grad_out: (grad_out, grad_out * -1.0),
                         name=f"SubBackward({x.name}, {y.name})",
                     )
+                elif op == "div":
+                    saved = {"left": x.clone(), "right": y.clone()}
+
+                    def div_backward(grad_out: Value) -> tuple[Value, ...]:
+                        left = saved["left"]
+                        right = saved["right"]
+                        grad_left = grad_out / right
+                        # 等价于 -grad_out * left / right²。
+                        # 分两次除以 right，避免先平方让很小的分母下溢为零。
+                        grad_right = (grad_out * -1.0) * (left / right) / right
+                        return (grad_left, grad_right)
+
+                    node = InnerNode(
+                        edges,
+                        div_backward,
+                        data=saved,
+                        name=f"DivBackward({x.name}, {y.name})",
+                    )
                 elif op in ("mul", "matmul"):
                     # 保留前向快照，同时保留它到原输入的求导关系。
                     # x.meta.clone() 只有数值；x.clone() 则通过 CloneBackward 连接 x。
-                    # 这是教学策略；真实 PyTorch 通常保存张量并做版本检查。
                     saved = {"left": x.clone(), "right": y.clone()}
                     if op == "mul":
 
@@ -629,7 +689,7 @@ class ExecuteLayer:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
-        if op in ("transpose", "clone", "exponential","relu"):
+        if op in ("transpose", "clone", "exponential", "relu", "log"):
             return kernel(x)
         if op == "sum":
             return kernel(x, options.dim, keepdim=options.keepdim)
@@ -644,7 +704,7 @@ class ExecuteLayer:
 
 
 class Dispatch:
-    """分清 Tensor 输入 y 和非 Tensor 配置；配置只能通过关键字传入。"""
+    """配置只能通过关键字传入。"""
 
     def __init__(self, *, _trace: bool = False) -> None:
         self._trace = _trace
@@ -653,6 +713,8 @@ class Dispatch:
                 "add",
                 "sub",
                 "mul",
+                "div",
+                "log",
                 "scale",
                 "matmul",
                 "transpose",
@@ -704,7 +766,16 @@ class Dispatch:
         if op != "reshape" and shape is not None:
             raise TypeError(f"{op} 不接受 shape")
 
-        unary = {"transpose", "clone", "sum", "expand", "reshape", "exponential","relu"}
+        unary = {
+            "transpose",
+            "clone",
+            "sum",
+            "expand",
+            "reshape",
+            "exponential",
+            "relu",
+            "log",
+        }
         if op in unary:
             if y is not None:
                 raise TypeError(f"{op} 只接受一个 Value；dim/size 等配置请使用关键字")
@@ -714,6 +785,14 @@ class Dispatch:
             y = float(y)
         elif not isinstance(y, Value):
             raise TypeError(f"{op} 需要两个 Value")
+
+        # 与 no_grad 使用相同的定义域检查，且检查失败时不创建反向图。
+        if op == "div":
+            if not isinstance(y, Value):
+                raise TypeError("div 需要两个 Value")
+            _check_div_inputs(x.meta, y.meta)
+        elif op == "log":
+            _check_log_input(x.meta)
 
         normalized_dim = dim
         if op == "sum" and dim is not None:
@@ -957,7 +1036,6 @@ def main() -> None:
     first.sum().backward()
     print("平方和的二阶结果：", z.grad)  # 全部为 2
 
-    print("=== 原来的矩阵示例：普通 backward 不记录梯度计算 ===")
     # 创建模型
     model = myModulde("m1")
     # 创建输入
