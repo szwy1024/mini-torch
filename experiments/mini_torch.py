@@ -1,7 +1,7 @@
-"""学习阶段 05：独立 Storage、矩阵乘法与数乘。
+"""学习阶段 06：Dispatcher 中独立的 Autograd 处理层。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch5.py；元数据、存储及二维 matmul 求导。
+补建说明：源自 pytorch6.py；修复 x.meta 属性拼写，保留 redispatch 的教学结构。
 """
 
 from __future__ import annotations
@@ -57,8 +57,8 @@ class _Meta:
         return f"_Meta(data={self.data}, shape={self.shape})"
 
 
-class Dispatch:
-    """统一数值入口；以后可以在这一层选择不同设备的计算实现。"""
+class CPUBackend:
+    """CPU 数值实现：只处理 _Meta，不创建反向节点。"""
 
     @staticmethod
     def _check_same_shape(x: _Meta, y: _Meta) -> None:
@@ -111,9 +111,6 @@ class Dispatch:
         )
 
 
-_dispatch = Dispatch()
-
-
 class Node:
     """反向边及局部求导接口；节点不保存一次任务的累计梯度。"""
 
@@ -140,7 +137,7 @@ class LeafNode(Node):
         previous = self.value.grad
         # 如果之前value中没有记录梯度，直接clone，否则对梯度进行累加
         self.value.grad = (
-            grad_out.clone() if previous is None else _dispatch.add(previous, grad_out)
+            grad_out.clone() if previous is None else _dispatch.call_backend("add", previous, grad_out)
         )
         return ()
 
@@ -191,87 +188,174 @@ class Value:
     def shape(self) -> tuple[int, ...]:
         return self.meta.shape
 
-    # 重载value的运算符，然后在重载运算符的函数中实现反向计算图的构造。
-    # 正向计算和反向计算都通过dispatch实现
     def __add__(self, other: Value) -> Value:
-        result = _dispatch.add(self.meta, other.meta)
-        require_grad = self.require_grad or other.require_grad
-        node = None
-        if require_grad:
-            node = InnerNode(
-                [self.node, other.node],
-                lambda grad_out: (grad_out, grad_out),
-                name=f"AddBackward({self.name}, {other.name})",
-            )
-        return Value(result, f"({self.name}+{other.name})", require_grad, node)
+        return _dispatch.call("add", self, other)
 
     def __sub__(self, other: Value) -> Value:
-        result = _dispatch.sub(self.meta, other.meta)
-        require_grad = self.require_grad or other.require_grad
-        node = None
-        if require_grad:
-            node = InnerNode(
-                [self.node, other.node],
-                lambda grad_out: (grad_out, _dispatch.scale(grad_out, -1.0)),
-                name=f"SubBackward({self.name}, {other.name})",
-            )
-        return Value(result, f"({self.name}-{other.name})", require_grad, node)
+        return _dispatch.call("sub", self, other)
 
     def __mul__(self, other: Value | float | int) -> Value:
-        # 如果是数乘
         if isinstance(other, (int, float)):
-            scalar = float(other)
-            result = _dispatch.scale(self.meta, scalar)
-            node = None
-            if self.require_grad:
-                node = InnerNode(
-                    [self.node],
-                    lambda grad_out: (_dispatch.scale(grad_out, scalar),),
-                    name=f"ScaleBackward({self.name}, {scalar})",
-                )
-            return Value(result, f"({self.name}*{scalar})", self.require_grad, node)
-
-        # 矩阵对应元素相乘
-        result = _dispatch.mul(self.meta, other.meta)
-        require_grad = self.require_grad or other.require_grad
-        node = None
-        if require_grad:
-            # 保存副本：后续修改输入数据，不会改变这次前向对应的求导规则。
-            saved = {"left": self.meta.clone(), "right": other.meta.clone()}
-            node = InnerNode(
-                [self.node, other.node],
-                lambda grad_out: (
-                    _dispatch.mul(grad_out, saved["right"]),
-                    _dispatch.mul(grad_out, saved["left"]),
-                ),
-                data=saved,
-                name=f"MulBackward({self.name}, {other.name})",
-            )
-        return Value(result, f"({self.name}*{other.name})", require_grad, node)
+            return _dispatch.call("scale", self, float(other))
+        return _dispatch.call("mul", self, other)
 
     def __rmul__(self, scalar: float | int) -> Value:
         return self * scalar
 
     def __matmul__(self, other: Value) -> Value:
-        result = _dispatch.matmul(self.meta, other.meta)
-        require_grad = self.require_grad or other.require_grad
-        node = None
-        if require_grad:
-            saved = {"left": self.meta.clone(), "right": other.meta.clone()}
-            node = InnerNode(
-                [self.node, other.node],
-                # C=A@B，G=dL/dC：dL/dA=G@B.T，dL/dB=A.T@G。
-                lambda grad_out: (
-                    _dispatch.matmul(grad_out, _dispatch.transpose(saved["right"])),
-                    _dispatch.matmul(_dispatch.transpose(saved["left"]), grad_out),
-                ),
-                data=saved,
-                name=f"MatmulBackward({self.name}, {other.name})",
-            )
-        return Value(result, f"({self.name}@{other.name})", require_grad, node)
+        return _dispatch.call("matmul", self, other)
 
     def backward(self, seed: _Meta | None = None) -> None:
         backward(self, seed)
+
+
+class Autograd:
+    """独立的算子处理层：记录求导信息，再把同一个算子继续派发下去。
+
+    这里负责前向时建立反向图；
+    AutogradEngine 负责 backward 时执行图。
+    两者不是同一个组件。本版仍没有全局 grad mode 和高阶求导。
+    """
+
+    def __init__(self, dispatcher: Dispatch) -> None:
+        self.dispatcher = dispatcher
+
+    def apply(
+        self, op: str, x: Value, y: Value | float, excluded: frozenset[str]
+    ) -> Value:
+        # 如果y是value，那么y需不需要梯度取决于y.require_grad
+        # 如果y不是value，那么y不需要梯度
+        other_requires_grad = y.require_grad if isinstance(y, Value) else False
+        require_grad = x.require_grad or other_requires_grad
+        node: Node | None = None
+        # 具体的回调函数是dispatch中的call_backend  
+        raw = self.dispatcher.call_backend
+
+        # 如果不需要梯度，直接redispatch，然后返回新创建的value结点，里面关联了node
+        if require_grad:
+            if op == "scale":
+                if not isinstance(y, float):
+                    raise TypeError("scale 的第二个参数必须是 float")
+                scalar = y
+                node = InnerNode(
+                    [x.node],
+                    lambda grad_out: (raw("scale", grad_out, scalar),),
+                    name=f"ScaleBackward({x.name}, {scalar})",
+                )
+            else:
+                if not isinstance(y, Value):
+                    raise TypeError(f"{op} 的第二个参数必须是 Value")
+                edges = [x.node, y.node]
+                if op == "add":
+                    node = InnerNode(
+                        edges, lambda grad_out: (grad_out, grad_out),
+                        name=f"AddBackward({x.name}, {y.name})",
+                    )
+                elif op == "sub":
+                    node = InnerNode(
+                        edges,
+                        lambda grad_out: (grad_out, raw("scale", grad_out, -1.0)),
+                        name=f"SubBackward({x.name}, {y.name})",
+                    )
+                elif op in ("mul", "matmul"):
+                    saved = {"left": x.meta.clone(), "right": y.meta.clone()}
+                    if op == "mul":
+                        def mul_backward(grad_out: _Meta) -> tuple[_Meta, ...]:
+                            return (
+                                raw("mul", grad_out, saved["right"]),
+                                raw("mul", grad_out, saved["left"]),
+                            )
+                        backrule = mul_backward
+                    else:
+                        def matmul_backward(grad_out: _Meta) -> tuple[_Meta, ...]:
+                            return (
+                                raw("matmul", grad_out, raw("transpose", saved["right"])),
+                                raw("matmul", raw("transpose", saved["left"]), grad_out),
+                            )
+                        backrule = matmul_backward
+                    node = InnerNode(
+                        edges, backrule, data=saved,
+                        name=f"{op.capitalize()}Backward({x.name}, {y.name})",
+                    )
+                else:
+                    raise NotImplementedError(f"缺少 {op} 的反向规则")
+
+        # 再次派发同一个 op，显式排除本层，避免重新选中 Autograd。
+        # 输入仍是 Value，requires_grad 也不变；排除的是处理层，而非输入信息。
+        result = self.dispatcher.redispatch(op, x, y, exclude=excluded | {"Autograd"})
+        return Value(result.meta, result.name, require_grad, node)
+
+
+class Dispatch:
+    """最小的两层 Dispatcher：Autograd 的优先级高于 CPU。
+
+    call/redispatch 接收 Value，按处理层选择实现。
+    call_backend 接收 _Meta，查找 CPU 算子实现，供 CPU 层和原始梯度计算使用。
+    本例固定只有 CPU，不从 Tensor 派发键或线程局部状态提取 key。
+    """
+
+    def __init__(self, *, trace: bool = False) -> None:
+        cpu = CPUBackend()
+        self.trace = trace
+        # 算子名与具体 CPU 实现分离；新增设备时需要扩展这张表及选择逻辑。
+        self.cpu_kernels: dict[str, Callable[..., _Meta]] = {
+            "add": cpu.add, "sub": cpu.sub, "mul": cpu.mul,
+            "scale": cpu.scale, "matmul": cpu.matmul, "transpose": cpu.transpose,
+        }
+        self.autograd = Autograd(self)
+        self.layers: dict[
+            str, Callable[[str, Value, Value | float, frozenset[str]], Value]
+        ] = {
+            "Autograd": self.autograd.apply,
+            "CPU": self._cpu,
+        }
+        self.priority = ("Autograd", "CPU")
+
+    def call(self, op: str, x: Value, y: Value | float) -> Value:
+        return self.redispatch(op, x, y, exclude=frozenset())
+
+    def redispatch(
+        self, op: str, x: Value, y: Value | float, *, exclude: frozenset[str]
+    ) -> Value:
+        if op not in self.cpu_kernels or op == "transpose":
+            raise NotImplementedError(f"不支持 Value 算子 {op}")
+        for key in self.priority:
+            if key not in exclude:
+                if self.trace:
+                    print(f"Dispatcher: {op} → {key}；排除 {sorted(exclude)}")
+                return self.layers[key](op, x, y, exclude)
+        raise RuntimeError(f"{op} 没有可用处理层，已排除 {sorted(exclude)}")
+
+    def _cpu(
+        self, op: str, x: Value, y: Value | float, excluded: frozenset[str]
+    ) -> Value:
+        argument = y.meta if isinstance(y, Value) else y
+        result = self.call_backend(op, x.meta, argument)
+        label = y.name if isinstance(y, Value) else str(y)
+        # CPU 层只包装数值，反向节点由外层 Autograd 关联。
+        return Value(result, name=f"{op}({x.name}, {label})", require_grad=False)
+
+    # call_backend现在接受的参数只能是底层的meta，
+    def call_backend(self, op: str, x: _Meta, y: _Meta | float | None = None) -> _Meta:
+        """直接选择 CPU 数值实现，不记录反向图；梯度尚未升级为 Value。"""
+        kernel = self.cpu_kernels.get(op)
+        if kernel is None:
+            raise NotImplementedError(f"CPU 未注册算子 {op}")
+        if self.trace:
+            print(f"  CPU kernel: {op}")
+        if op == "transpose":
+            if y is not None:
+                raise TypeError("transpose 只接受一个张量")
+            return kernel(x)
+        if op == "scale":
+            if not isinstance(y, (int, float)):
+                raise TypeError("scale 需要数值系数")
+        elif not isinstance(y, _Meta):
+            raise TypeError(f"{op} 需要两个 _Meta 张量")
+        return kernel(x, y)
+
+
+_dispatch = Dispatch()
 
 
 class AutogradEngine:
@@ -280,7 +364,7 @@ class AutogradEngine:
     def run_backward(self, output: Node, seed: _Meta) -> None:
         nodes = self._collect_nodes(output)
         pending = self._compute_dependencies(nodes)
-        # 每个节点的梯度是不同形状的张量，首份贡献直接复制。
+        # 不预填 0.0：每个节点的梯度是不同形状的张量，首份贡献直接复制。
         grad_buffers: dict[Node, _Meta] = {output: seed.clone()}
         ready: deque[Node] = deque([output])
 
@@ -333,7 +417,7 @@ class AutogradEngine:
             grad_buffers[edge] = (
                 contribution.clone()
                 if previous is None
-                else _dispatch.add(previous, contribution)
+                else _dispatch.call_backend("add", previous, contribution)
             )
             pending[edge] -= 1
             print(
@@ -385,6 +469,7 @@ class myModulde(module):
 
 def main() -> None:
     print("=== 前向：矩阵乘法与数乘 ===")
+    _dispatch.trace = True  # 显示前向与反向的派发路径。
     model = myModulde("m1")
     input = Value(_Meta([1, 2], [1, 2]), name="input", require_grad=False)
     output = model(input)
