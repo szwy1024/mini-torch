@@ -1,7 +1,9 @@
-"""学习阶段 22：批量 matmul、permute 与多头因果 Attention。
+"""学习阶段 23：单文件检查入口与可复现实验。
 
 运行：python experiments/mini_torch.py
-支持 (B,T,D) 输入和 batch 维广播；没有新增 NumPy/PyTorch 依赖。one-hot 嵌入仍以教学清晰为优先。
+python experiments/mini_torch.py --check；默认训练小型多头因果 Transformer，可用 --demo regression。
+查看学习顺序：git log --reverse --oneline -- experiments/mini_torch.py；用 git show <commit>:experiments/mini_torch.py 查看阶段代码。
+边界：CPU/Python list、显式逐元素广播、物化快照；不实现 GPU、dropout、图释放或原地版本检查，不能用于性能结论。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -1453,22 +1455,206 @@ def _token_layout(tokens: Sequence[int] | Sequence[Sequence[int]], vocab_size: i
     return [token for row in checked for token in row], (len(rows), width)
 
 
-def main() -> None:
-    model = TinyTransformerLM(3, d_model=6, d_ff=12, num_heads=2, max_seq_len=6)
-    tokens = [[0,1,2,0,1,2], [1,2,0,1,2,0], [2,0,1,2,0,1]]
-    targets = [[1,2,0,1,2,0], [2,0,1,2,0,1], [0,1,2,0,1,2]]
-    optimizer = SGD(model.parameters(), lr=0.06)
-    losses = []
-    for step in range(80):
+def _assert_close(actual: Sequence[float], expected: Sequence[float], *, tol: float = 1e-8) -> None:
+    if len(actual) != len(expected) or not all(math.isclose(a,b,rel_tol=tol,abs_tol=tol)
+                                             for a,b in zip(actual,expected,strict=True)):
+        raise AssertionError(f"数值不一致：{list(actual)} != {list(expected)}")
+
+
+def self_test() -> None:
+    """标准库即可运行的数值/集成回归；另以 PyTorch float64 做外部数值验证。"""
+    checks = 0
+    def expect_error(error: type[Exception], fn: Callable[[], object]) -> None:
+        nonlocal checks
+        try:
+            fn()
+        except error:
+            checks += 1
+        else:
+            raise AssertionError(f"预期 {error.__name__}")
+    def tensor(data: Sequence[float], shape: Sequence[int], grad: bool = True) -> Value:
+        return Value(_Meta(data,shape),name="test",require_grad=grad)
+
+    # 三阶求导验证梯度仍是带求导关系的 Value。
+    x=tensor([2],())
+    (x*x*x).backward(create_graph=True)
+    first=x.grad
+    _assert_close(first.data,[12])
+    x.grad=None
+    first.backward(create_graph=True)
+    second=x.grad
+    _assert_close(second.data,[12])
+    x.grad=None
+    second.backward()
+    _assert_close(x.grad.data,[6])
+    checks += 1
+
+    x=tensor([1,4,9],(3,))
+    x.sqrt().sum().backward(create_graph=True)
+    first=x.grad
+    _assert_close(first.data,[.5,.25,1/6])
+    x.grad=None
+    first.sum().backward()
+    _assert_close(x.grad.data,[-.25,-1/32,-1/108])
+    checks += 1
+
+    bias=tensor([1,2,3],(3,))
+    bias.broadcast_to((2,3)).backward(tensor([1,2,3,4,5,6],(2,3),False))
+    _assert_close(bias.grad.data,[5,7,9])
+    empty=tensor([], (0,1)).broadcast_to((2,0,3))
+    if empty.shape != (2,0,3): raise AssertionError("空维度广播失败")
+    checks += 1
+
+    for enabled in (False,True):
+        with set_grad_enabled(enabled):
+            result=tensor([1],()).sqrt()
+            if result.require_grad != enabled: raise AssertionError("梯度模式错误")
+    if not is_grad_enabled(): raise AssertionError("梯度模式没有恢复")
+    checks += 1
+
+    a=tensor([1,2,3,4],(2,1,2))
+    b=tensor([2,3],(2,1))
+    (a@b).sum().backward()
+    _assert_close(a.grad.data,[2,3,2,3])
+    _assert_close(b.grad.data,[4,6])
+    perm=tensor(list(range(12)),(2,2,3))
+    _assert_close(perm.permute((0,2,1)).permute((0,2,1)).data,perm.data)
+    checks += 1
+
+    tie=tensor([5,5,1],(3,))
+    tie.max().backward()
+    _assert_close(tie.grad.data,[1,0,0])
+    scores=tensor([1000,1001,999,-1000,-999,-1001],(2,3))
+    probs=scores.softmax()
+    _assert_close(probs.sum(-1).data,[1,1])
+    _assert_close(scores.log_softmax().exp().data,probs.data)
+    loss=cross_entropy(scores,[1,0])
+    loss.backward()
+    expected=[(p-float(i==label))/2 for row,label in zip([probs.data[:3],probs.data[3:]],[1,0])
+              for i,p in enumerate(row)]
+    _assert_close(scores.grad.data,expected)
+    checks += 1
+
+    norm=LayerNorm(3)
+    out=norm(tensor([2,2,2,1,2,3],(2,3)))
+    _assert_close(out.data[:3],[0,0,0])
+    if not all(math.isfinite(v) for v in out.data): raise AssertionError("LayerNorm 产生非有限值")
+    checks += 1
+
+    root=Module("root")
+    root.child=Module("child")
+    root.child.layer=Linear(2,3,rng=random.Random(1))
+    root.alias=root.child.layer.weight
+    root.child.parent=root
+    if len(list(root.parameters())) != 2: raise AssertionError("共享/循环模块去重失败")
+    del root.child.layer
+    if len(list(root.parameters())) != 1: raise AssertionError("删除子模块清理失败")
+    del root.alias
+    if list(root.parameters()): raise AssertionError("删除参数清理失败")
+    p=Parameter(_Meta([2],()))
+    opt=SGD(iter([p,p]),lr=.1)
+    (p*p).backward()
+    opt.step()
+    _assert_close(p.data,[1.6])
+    checks += 1
+
+    embed=Embedding(3,2,rng=random.Random(2))
+    embed([1,1,2]).sum().backward()
+    _assert_close(embed.weight.grad.data,[0,0,2,2,1,1])
+    checks += 1
+
+    attn=CausalSelfAttention(4,num_heads=2,rng=random.Random(5))
+    source=[.1,.2,.3,.4, .2,.4,.6,.8, .4,.3,.2,.1]
+    with no_grad():
+        original=attn(tensor(source,(3,4),False))
+        changed=source.copy()
+        changed[-4:]=[10,20,30,40]
+        altered=attn(tensor(changed,(3,4),False))
+        _assert_close(original.data[:8],altered.data[:8])
+        batch=attn(tensor(source+source,(2,3,4),False))
+        _assert_close(batch.data,original.data+original.data)
+    checks += 1
+
+    block=TransformerBlock(4,8,num_heads=2,rng=random.Random(6))
+    x=tensor(source,(3,4))
+    y=block(x)
+    (y*y).mean().backward()
+    if y.shape != x.shape or any(p.grad is None for p in block.parameters()):
+        raise AssertionError("Transformer Block 反向失败")
+    model=TinyTransformerLM(3,num_heads=2)
+    logits=model([[0,1,2],[1,2,0]])
+    cross_entropy(logits,[[1,2,0],[2,0,1]]).backward()
+    if any(p.grad is None for p in model.parameters()): raise AssertionError("LM 参数梯度遗漏")
+    checks += 1
+
+    expect_error(ZeroDivisionError,lambda: tensor([1],())/tensor([0],()))
+    expect_error(ValueError,lambda: tensor([-1],()).log())
+    expect_error(ValueError,lambda: tensor([-1],()).sqrt())
+    expect_error(ValueError,lambda: tensor([1,2],(2,)).broadcast_to((3,)))
+    expect_error(ValueError,lambda: tensor([1,2],(2,)).permute((0,0)))
+    expect_error(ValueError,lambda: tensor([-math.inf,-math.inf],(2,)).softmax())
+    expect_error(ValueError,lambda: CausalSelfAttention(4,num_heads=3))
+    expect_error(ValueError,lambda: Embedding(3,2)([3]))
+    expect_error(ValueError,lambda: model([[0,1],[1]]))
+    expect_error(ValueError,lambda: cross_entropy(tensor([1,2,3],(1,3)),[3]))
+    expect_error(ValueError,lambda: SGD(iter([]),lr=-1))
+    expect_error(ValueError,lambda: CPUBackend("cpu").max(_Meta([1],()),dim=3))
+    expect_error(TypeError,lambda: CPUBackend("cpu").max(_Meta([1],()),keepdim=1))
+    print(f"PASS: {checks} groups of numerical, gradient, shape and integration checks")
+
+
+def train_demo(steps: int = 80, seed: int = 42, num_heads: int = 2) -> tuple[TinyTransformerLM, list[float]]:
+    model=TinyTransformerLM(3,d_model=6,d_ff=12,num_heads=num_heads,max_seq_len=6,seed=seed)
+    tokens=[[0,1,2,0,1,2],[1,2,0,1,2,0],[2,0,1,2,0,1]]
+    targets=[[1,2,0,1,2,0],[2,0,1,2,0,1],[0,1,2,0,1,2]]
+    optimizer=SGD(model.parameters(),lr=.06)
+    history=[]
+    for step in range(steps):
         optimizer.zero_grad()
-        loss = cross_entropy(model(tokens), targets)
-        losses.append(loss.data[0])
+        loss=cross_entropy(model(tokens),targets)
+        if not math.isfinite(loss.data[0]): raise ArithmeticError("训练损失不是有限数")
+        history.append(loss.data[0])
         loss.backward()
         optimizer.step()
-        if step in (0,19,39,79):
-            print(f"step={step:02d} cross_entropy={loss.data[0]:.6f}")
-    assert losses[-1] < losses[0] * 0.5
-    print("两个注意力头，batch=3；greedy tokens：", model.generate([0,1,2], 9))
+        if step == 0 or (step+1)%20 == 0 or step == steps-1:
+            print(f"step={step:03d} cross_entropy={loss.data[0]:.6f}")
+    print("greedy tokens:",model.generate([0,1,2],9))
+    return model,history
+
+
+def regression_demo(steps: int = 80, seed: int = 7) -> None:
+    rng=random.Random(seed)
+    first,last=Linear(2,8,rng=rng),Linear(8,1,rng=rng)
+    x=Value(_Meta([-1,-1,-1,1,1,-1,1,1],(4,2)),require_grad=False)
+    target=Value(_Meta([1.5,-4.5,5.5,-.5],(4,1)),require_grad=False)
+    optimizer=SGD(iter([*first.parameters(),*last.parameters()]),lr=.04)
+    for step in range(steps):
+        optimizer.zero_grad()
+        diff=last(first(x).relu())-target
+        loss=(diff*diff).mean()
+        loss.backward()
+        optimizer.step()
+        if step == 0 or step == steps-1:
+            print(f"step={step:03d} MSE={loss.data[0]:.8f}")
+
+
+def main() -> None:
+    import argparse
+    parser=argparse.ArgumentParser(description="Single-file educational autograd and causal Transformer")
+    parser.add_argument("--check",action="store_true",help="运行不依赖第三方包的数值与集成检查")
+    parser.add_argument("--demo",choices=("train","regression"),default="train")
+    parser.add_argument("--steps",type=int,default=80)
+    parser.add_argument("--seed",type=int,default=42)
+    parser.add_argument("--heads",type=int,default=2)
+    args=parser.parse_args()
+    if args.steps <= 0:
+        parser.error("--steps 必须大于零")
+    if args.check:
+        self_test()
+    elif args.demo == "regression":
+        regression_demo(args.steps,args.seed)
+    else:
+        train_demo(args.steps,args.seed,args.heads)
 
 
 if __name__ == "__main__":
