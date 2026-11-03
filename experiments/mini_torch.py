@@ -1,7 +1,7 @@
-"""学习阶段 18：max 掩码与稳定 softmax / log_softmax。
+"""学习阶段 19：单头 Self-Attention 与因果掩码。
 
 运行：python experiments/mini_torch.py
-max 并列时选首个位置；softmax 拒绝整行负无穷。组合运算保留高阶求导。
+掩码为非可微常量，在 softmax 前加负无穷；每行保留对角线，避免整行被屏蔽。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -1208,17 +1208,47 @@ def _check_softmax(x: Value, dim: int) -> int:
     return axis
 
 
+def causal_mask(length: int) -> Value:
+    if type(length) is not int or length <= 0:
+        raise ValueError("因果掩码长度必须是正整数")
+    return Value(_Meta([0.0 if col <= row else -math.inf
+                        for row in range(length) for col in range(length)],
+                       (length, length)), name="causal_mask", require_grad=False)
+
+
+class CausalSelfAttention(Module):
+    def __init__(self, d_model: int, *, rng: random.Random | None = None) -> None:
+        super().__init__("CausalSelfAttention")
+        self.query = Linear(d_model, d_model, rng=rng)
+        self.key = Linear(d_model, d_model, rng=rng)
+        self.value = Linear(d_model, d_model, rng=rng)
+        self.projection = Linear(d_model, d_model, rng=rng)
+        self.d_model = d_model
+
+    def forward(self, x: Value) -> Value:
+        if len(x.shape) != 2 or x.shape[0] == 0 or x.shape[1] != self.d_model:
+            raise ValueError("Attention 输入必须是非空 (序列长度, d_model)")
+        q, k, v = self.query(x), self.key(x), self.value(x)
+        scores = (q @ k.T) * (self.d_model ** -0.5)
+        self.attention_weights = (scores + causal_mask(x.shape[0])).softmax(-1)
+        return self.projection(self.attention_weights @ v)
+
+
 def main() -> None:
-    x = Value(_Meta([1000,1001,1002, -1000,-1000,-1000], (2,3)), name="scores")
-    p = x.softmax()
-    assert all(math.isclose(v, 1) for v in p.sum(-1).data)
-    seed = Value(_Meta([1,2,4, 1,2,4], (2,3)), require_grad=False)
-    p.backward(seed)
-    print("稳定 softmax：", p.data)
-    print("scores 梯度：", x.grad.data)
-    tie = Value(_Meta([5,5,1], (3,)))
-    tie.max().backward()
-    assert tie.grad.data == [1,0,0]
+    attn = CausalSelfAttention(4, rng=random.Random(3))
+    x = Value(_Meta([.1,.2,.3,.4, .2,.4,.6,.8, .4,.3,.2,.1], (3,4)))
+    y = attn(x)
+    weights = attn.attention_weights.data
+    assert weights[1] == weights[2] == weights[5] == 0
+    (y * y).mean().backward()
+    assert all(p.grad is not None for p in attn.parameters())
+    with no_grad():
+        changed = x.data.copy()
+        changed[-4:] = [100,200,300,400]
+        future_changed = attn(Value(_Meta(changed, x.shape), require_grad=False))
+    assert all(math.isclose(a,b) for a,b in zip(y.data[:8], future_changed.data[:8], strict=True))
+    print("因果 Attention 输出：", y.data)
+    print("修改未来 token 不影响前两个位置：通过")
 
 
 if __name__ == "__main__":
