@@ -1,7 +1,7 @@
-"""学习阶段 09：Parameter 注册与 SGD 优化器。
+"""学习阶段 10：sum、expand、reshape 和不可变算子配置。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch9.py；同一参数的多个属性按对象身份去重，避免重复更新。
+补建说明：pytorch10.py 原稿未完成；使用当时补齐并验证的 sum/expand 版本恢复可运行阶段。
 """
 
 from __future__ import annotations
@@ -9,8 +9,9 @@ from __future__ import annotations
 from collections import deque
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from math import prod
-from typing import Callable,Generator, Sequence
+from typing import Callable, Generator, Sequence
 from typing import Iterator
 
 # ContextVar 保存当前执行上下文的状态，嵌套或异常退出时用 token 恢复。
@@ -22,7 +23,7 @@ def is_grad_enabled() -> bool:
 
 
 @contextmanager
-def set_grad_enabled(enabled: bool) -> Generator[None,None,None]:
+def set_grad_enabled(enabled: bool) -> Generator[None, None, None]:
     """本例只支持 with 用法；不修改任何输入的 require_grad。"""
     token = _grad_enabled.set(enabled)
     try:
@@ -61,7 +62,7 @@ class _Meta:
                 f"数据长度 {len(self.data)} 与 shape={self.shape} "
                 f"需要的元素数 {self.numel} 不一致"
             )
-        
+
     @property
     def data(self) -> list[float]:
         return self.storage.data
@@ -70,6 +71,10 @@ class _Meta:
     def numel(self) -> int:
         # shape=() 表示标量，需要一个元素；shape=(0, 3) 则需要零个元素。
         return prod(self.shape)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
 
     def clone(self) -> _Meta:
         return _Meta(self.data, self.shape)
@@ -85,12 +90,47 @@ class _Meta:
     def __repr__(self) -> str:
         return f"_Meta(data={self.data}, shape={self.shape})"
 
-class Backend:
-        def __init__(self,name:str):
-            self.name = name
 
-        def get_ability(self) -> dict[str, Callable[..., _Meta]]:
-            raise NotImplementedError
+def _normalize_dim(dim: int, ndim: int, *, insert: bool = False) -> int:
+    """普通维度范围 [-ndim, ndim-1]；插入位置范围 [-ndim-1, ndim]。"""
+    if type(dim) is not int:
+        raise TypeError("dim 必须是整数，不能是 bool 或浮点数")
+    limit = ndim + 1 if insert else max(ndim, 1)
+    if not -limit <= dim < limit:
+        raise ValueError(f"dim={dim} 超出范围；输入维数={ndim}，insert={insert}")
+    return dim + limit if dim < 0 else dim
+
+
+def _check_size(size: int) -> None:
+    if type(size) is not int:
+        raise TypeError("size 必须是整数，不能是 bool 或浮点数")
+    if size < 0:
+        raise ValueError("size 必须大于或等于 0")
+
+
+def _check_shape(shape: Sequence[int]) -> tuple[int, ...]:
+    result = tuple(shape)
+    if any(type(dim) is not int or dim < 0 for dim in result):
+        raise ValueError("shape 必须由非负整数组成；暂不支持 -1 推断")
+    return result
+
+
+@dataclass(frozen=True)
+class OpOptions:
+    """在处理层之间传递不可变的算子配置；配置不参与梯度计算。"""
+
+    dim: int | None = None
+    size: int | None = None
+    keepdim: bool = False
+    shape: tuple[int, ...] | None = None
+
+
+class Backend:
+    def __init__(self, name: str):
+        self.name = name
+
+    def get_ability(self) -> dict[str, Callable[..., _Meta]]:
+        raise NotImplementedError
 
 
 class CPUBackend(Backend):
@@ -152,12 +192,70 @@ class CPUBackend(Backend):
             (cols, rows),
         )
 
-    def get_ability(self)->dict[str,Callable[...,_Meta]]:
+    def sum(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
+        """沿单个维度求和；dim=None 求全部元素之和，空集合的和为 0。"""
+        if type(keepdim) is not bool:
+            raise TypeError("keepdim 必须是 bool")
+        if dim is None:
+            shape = (1,) * x.ndim if keepdim else ()
+            return _Meta([sum(x.data)], shape)
+
+        dim = _normalize_dim(dim, x.ndim)
+        # 标量允许 dim=0/-1；归约后仍为标量。
+        if x.ndim == 0:
+            return x.clone()
+        outer = prod(x.shape[:dim])
+        reduce_size = x.shape[dim]
+        inner = prod(x.shape[dim + 1:])
+        result: list[float] = []
+        for outer_index in range(outer):
+            for inner_index in range(inner):
+                total = 0.0
+                for reduce_index in range(reduce_size):
+                    offset = outer_index * reduce_size * inner + reduce_index * inner + inner_index
+                    total += x.data[offset]
+                result.append(total)
+        middle = (1,) if keepdim else ()
+        shape = x.shape[:dim] + middle + x.shape[dim + 1:]
+        return _Meta(result, shape)
+
+    def expand(self, x: _Meta, dim: int, size: int) -> _Meta:
+        """本例定义：在 dim 插入长度为 size 的新维，并复制数据。
+
+        等价于 torch.unsqueeze(x, dim) 后将新维 expand 到 size，再物化副本。
+        例如 (2,) 在 dim=1,size=3 时变成 (2,3)，并非 PyTorch 的 expand 接口。
+        """
+        dim = _normalize_dim(dim, x.ndim, insert=True)
+        _check_size(size)
+        outer = prod(x.shape[:dim])
+        inner = prod(x.shape[dim:])
+        result: list[float] = []
+        for outer_index in range(outer):
+            block = x.data[outer_index * inner:(outer_index + 1) * inner]
+            for _ in range(size):
+                result.extend(block)
+        return _Meta(result, x.shape[:dim] + (size,) + x.shape[dim:])
+
+    def reshape(self, x: _Meta, shape: Sequence[int]) -> _Meta:
+        """连续数据的形状转换，本例复制数据，暂不实现共享存储的 view。"""
+        target = _check_shape(shape)
+        if prod(target) != x.numel:
+            raise ValueError(f"reshape 元素数不匹配：{x.shape} → {target}")
+        return _Meta(x.data, target)
+
+    def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {
-                                    "add": self.add, "sub": self.sub, "mul": self.mul,
-                                    "scale": self.scale, "matmul": self.matmul,
-                                    "transpose": self.transpose, "clone": self.clone,
-                                }
+            "add": self.add,
+            "sub": self.sub,
+            "mul": self.mul,
+            "scale": self.scale,
+            "matmul": self.matmul,
+            "transpose": self.transpose,
+            "clone": self.clone,
+            "sum": self.sum,
+            "expand": self.expand,
+            "reshape": self.reshape,
+        }
 
 
 class GPUBackend(Backend):
@@ -165,19 +263,18 @@ class GPUBackend(Backend):
     def _check_same_shape(x: _Meta, y: _Meta) -> None:
         if x.shape != y.shape:
             raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
-    
+
     def __init__(self, name: str):
         super().__init__(name)
-
 
     def add(self, x: _Meta, y: _Meta) -> _Meta:
         self._check_same_shape(x, y)
         return _Meta([a + b for a, b in zip(x.data, y.data, strict=True)], x.shape)
 
-    def get_ability(self)->dict[str,Callable[...,_Meta]]:
+    def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {"add": self.add}
 
-    
+
 class Node:
     """反向规则的输入、输出现在都是 Value，可以继续参与自动微分。"""
 
@@ -275,6 +372,16 @@ class Value:
     def transpose(self) -> Value:
         return _dispatch.call("transpose", self)
 
+    def sum(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
+        return _dispatch.call("sum", self, dim=dim, keepdim=keepdim)
+
+    def expand(self, dim: int, size: int) -> Value:
+        """在 dim 插入并复制新维度，详见 CPUBackend.expand。"""
+        return _dispatch.call("expand", self, dim=dim, size=size)
+
+    def reshape(self, shape: Sequence[int]) -> Value:
+        return _dispatch.call("reshape", self, shape=shape)
+
     # 可以直接使用.T进行矩阵转置运算
     @property
     def T(self) -> Value:
@@ -282,9 +389,13 @@ class Value:
 
     # create_graph 表示是否在反向计算过程中再次构造反向计算图
     def backward(
-        self, seed: Value | None = None, *, create_graph: bool = False,_trace:bool = False
+        self,
+        seed: Value | None = None,
+        *,
+        create_graph: bool = False,
+        _trace: bool = False,
     ) -> None:
-        backward(self, seed, create_graph=create_graph,_trace = _trace)
+        backward(self, seed, create_graph=create_graph, _trace=_trace)
 
     def __repr__(self) -> str:
         return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
@@ -298,25 +409,34 @@ class Autograd:
 
     # excluded表示需要排除的处理流程
     def apply(
-        self, op: str, x: Value, y: Value | float | None, excluded: frozenset[str]
+        self,
+        op: str,
+        x: Value,
+        y: Value | float | None,
+        options: OpOptions,
+        excluded: frozenset[str],
     ) -> Value:
         # 只有value类型可能需要梯度，纯数值不关联梯度信息
         other_requires_grad = y.require_grad if isinstance(y, Value) else False
-        # 查询当前上下文是否开启了梯度。
+        # 查询当前上下文是否开启了梯度记录。
         require_grad = is_grad_enabled() and (x.require_grad or other_requires_grad)
         node: Node | None = None
         if self.dispatcher._trace:
-            print(f"  Autograd: grad_enabled={is_grad_enabled()}, record={require_grad}")
+            print(
+                f"  Autograd: grad_enabled={is_grad_enabled()}, record={require_grad}"
+            )
 
         if require_grad:
             if op == "clone":
                 node = InnerNode(
-                    [x.node], lambda grad_out: (grad_out,),
+                    [x.node],
+                    lambda grad_out: (grad_out,),
                     name=f"CloneBackward({x.name})",
                 )
             elif op == "transpose":
                 node = InnerNode(
-                    [x.node], lambda grad_out: (grad_out.T,),
+                    [x.node],
+                    lambda grad_out: (grad_out.T,),
                     name=f"TransposeBackward({x.name})",
                 )
             elif op == "scale":
@@ -324,21 +444,64 @@ class Autograd:
                     raise TypeError("scale 的第二个参数必须是 float")
                 scalar = y
                 node = InnerNode(
-                    [x.node], lambda grad_out: (grad_out * scalar,),
+                    [x.node],
+                    lambda grad_out: (grad_out * scalar,),
                     name=f"ScaleBackward({x.name}, {scalar})",
                 )
+            elif op == "sum":
+                input_shape = x.shape
+                axis = options.dim
+                if axis is None:
+                    def sum_all_backward(grad_out: Value) -> tuple[Value, ...]:
+                        result = grad_out.reshape(())
+                        for insert_axis, length in enumerate(input_shape):
+                            result = result.expand(insert_axis, length)
+                        return (result,)
+                    node = InnerNode([x.node], sum_all_backward, name=f"SumBackward({x.name})")
+                elif x.meta.ndim == 0:
+                    node = InnerNode(
+                        [x.node], lambda grad_out: (grad_out.reshape(()),),
+                        name=f"SumBackward({x.name})",
+                    )
+                else:
+                    sum_axis = axis
+                    reduced_shape = input_shape[:sum_axis] + input_shape[sum_axis + 1:]
+                    reduce_size = input_shape[sum_axis]
+                    def sum_axis_backward(grad_out: Value) -> tuple[Value, ...]:
+                        # keepdim=True 时先去掉长度为 1 的归约轴，再插入复制。
+                        gradient = grad_out.reshape(reduced_shape)
+                        return (gradient.expand(sum_axis, reduce_size),)
+                    node = InnerNode([x.node], sum_axis_backward, name=f"SumBackward({x.name})")
+            elif op == "expand":
+                expand_axis = options.dim
+                if expand_axis is None:
+                    raise RuntimeError("expand 缺少已验证的 dim")
+                # 前向插入复制的是新轴，反向将其求和并删除，恢复原形状。
+                node = InnerNode(
+                    [x.node], lambda grad_out: (grad_out.sum(expand_axis),),
+                    name=f"ExpandBackward({x.name})",
+                )
+            elif op == "reshape":
+                original_shape = x.shape
+                node = InnerNode(
+                    [x.node], lambda grad_out: (grad_out.reshape(original_shape),),
+                    name=f"ReshapeBackward({x.name})",
+                )
+
             else:
                 if not isinstance(y, Value):
                     raise TypeError(f"{op} 的第二个参数必须是 Value")
                 edges = [x.node, y.node]
                 if op == "add":
                     node = InnerNode(
-                        edges, lambda grad_out: (grad_out, grad_out),
+                        edges,
+                        lambda grad_out: (grad_out, grad_out),
                         name=f"AddBackward({x.name}, {y.name})",
                     )
                 elif op == "sub":
                     node = InnerNode(
-                        edges, lambda grad_out: (grad_out, grad_out * -1.0),
+                        edges,
+                        lambda grad_out: (grad_out, grad_out * -1.0),
                         name=f"SubBackward({x.name}, {y.name})",
                     )
                 elif op in ("mul", "matmul"):
@@ -347,89 +510,156 @@ class Autograd:
                     # 这是教学策略；真实 PyTorch 通常保存张量并做版本检查。
                     saved = {"left": x.clone(), "right": y.clone()}
                     if op == "mul":
+
                         def mul_backward(grad_out: Value) -> tuple[Value, ...]:
                             return (grad_out * saved["right"], grad_out * saved["left"])
+
                         backrule = mul_backward
                     else:
+
                         def matmul_backward(grad_out: Value) -> tuple[Value, ...]:
-                            return (grad_out @ saved["right"].T, saved["left"].T @ grad_out)
+                            return (
+                                grad_out @ saved["right"].T,
+                                saved["left"].T @ grad_out,
+                            )
+
                         backrule = matmul_backward
                     node = InnerNode(
-                        edges, backrule, data=saved,
+                        edges,
+                        backrule,
+                        data=saved,
                         name=f"{op.capitalize()}Backward({x.name}, {y.name})",
                     )
                 else:
                     raise NotImplementedError(f"缺少 {op} 的反向规则")
 
         # 排除 Autograd 只影响本次算子的后续派发，不改变当前梯度模式。
-        result = self.dispatcher.redispatch(op, x, y, exclude=excluded | {"Autograd"})
+        result = self.dispatcher.redispatch(
+            op, x, y, options=options, exclude=excluded | {"Autograd"}
+        )
         return Value(result.meta, result.name, require_grad, node)
 
 
 class ExecuteLayer:
-    def __init__(self,dispatcher:Dispatch):
+    def __init__(self, dispatcher: Dispatch) -> None:
         self.dispatcher = dispatcher
         cpu = CPUBackend("cpu")
         gpu = GPUBackend("gpu")
-        self.kernels: dict[str, dict[str,Callable[..., _Meta]]] = {"cpu":cpu.get_ability() ,
-                                                                   "gpu":gpu.get_ability()}
-                                
+        self.kernels: dict[str, dict[str, Callable[..., _Meta]]] = {
+            "cpu": cpu.get_ability(),
+            "gpu": gpu.get_ability(),
+        }
+
     def apply(
-            self, op: str, x: Value, y: Value | float | None, excluded: frozenset[str]
-        ) -> Value:
-            argument = y.meta if isinstance(y, Value) else y
-            result = self.call_kernel(op, x.meta, argument)
+        self, op: str, x: Value, y: Value | float | None,
+        options: OpOptions, excluded: frozenset[str],
+    ) -> Value:
+        argument = y.meta if isinstance(y, Value) else y
+        result = self.call_kernel(op, x.meta, argument, options=options)
+        if op in ("sum", "expand", "reshape"):
+            name = f"{op}({x.name}, {options})"
+        else:
             label = y.name if isinstance(y, Value) else str(y)
             name = f"{op}({x.name})" if y is None else f"{op}({x.name}, {label})"
-            # 中间计算节点默认不保存梯度
-            return Value(result, name=name, require_grad=False)
-    
-    def call_kernel(self, op: str, x: _Meta, y: _Meta | float | None = None) -> _Meta:
-        """仅负责调用backend数值实现；不是反向规则的直接入口。"""
-        # 后期根据数据的所在位置选择具体的后端，现在默认cpu
+        # CPU 层只包装数值，不决定最终输出是否需要梯度。
+        return Value(result, name=name, require_grad=False)
+
+    def call_kernel(
+        self, op: str, x: _Meta, y: _Meta | float | None = None, *, options: OpOptions
+    ) -> _Meta:
+        # 仍固定选 CPU；GPUBackend 只是占位，未实现 Metal 或设备存储。
         kernel = self.kernels["cpu"].get(op)
         if kernel is None:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
         if op in ("transpose", "clone"):
-            if y is not None:
-                raise TypeError(f"{op} 只接受一个张量")
             return kernel(x)
-        if op == "scale":
-            if not isinstance(y, (int, float)):
-                raise TypeError("scale 需要数值系数")
-        elif not isinstance(y, _Meta):
-            raise TypeError(f"{op} 需要两个 _Meta 张量")
+        if op == "sum":
+            return kernel(x, options.dim, keepdim=options.keepdim)
+        if op == "expand":
+            return kernel(x, options.dim, options.size)
+        if op == "reshape":
+            return kernel(x, options.shape)
         return kernel(x, y)
 
-    def get_kernels(self)->dict[str,dict[str,Callable[...,_Meta]]]:
+    def get_kernels(self) -> dict[str, dict[str, Callable[..., _Meta]]]:
         return self.kernels
 
 
 class Dispatch:
-    """前向和反向的 Value 运算都经过同一套 Autograd → CPU 派发。"""
+    """分清 Tensor 输入 y 和非 Tensor 配置；配置只能通过关键字传入。"""
 
     def __init__(self, *, _trace: bool = False) -> None:
         self._trace = _trace
-        #目前支持的算子操作
-        self.operator = ( "add", "sub", "mul", "scale", "matmul","transpose", "clone")
+        self.operator = frozenset({
+            "add", "sub", "mul", "scale", "matmul", "transpose", "clone",
+            "sum", "expand", "reshape",
+        })
         self.autograd = Autograd(self)
         self.executeLayer = ExecuteLayer(self)
-        self.kernels: dict[str, dict[str,Callable[..., _Meta]]] = self.executeLayer.get_kernels()
+        self.kernels = self.executeLayer.get_kernels()
         self.layers: dict[
-            str, Callable[[str, Value, Value | float | None, frozenset[str]], Value]
+            str, Callable[[str, Value, Value | float | None, OpOptions, frozenset[str]], Value]
         ] = {
             "Autograd": self.autograd.apply,
             "CPU": self.executeLayer.apply,
         }
         self.priority = ("Autograd", "CPU")
 
-    def call(self, op: str, x: Value, y: Value | float | None = None) -> Value:
-        return self.redispatch(op, x, y, exclude=frozenset())
+    def call(
+        self, op: str, x: Value, y: Value | float | None = None, *,
+        dim: int | None = None, size: int | None = None, keepdim: bool = False,
+        shape: Sequence[int] | None = None,
+    ) -> Value:
+        if op not in self.operator:
+            raise NotImplementedError(f"不支持 Value 算子 {op}")
+        if not isinstance(x, Value):
+            raise TypeError("x 必须是 Value")
+        if type(keepdim) is not bool:
+            raise TypeError("keepdim 必须是 bool")
+        if op != "sum" and keepdim:
+            raise TypeError(f"{op} 不接受 keepdim=True")
+        if op not in ("sum", "expand") and dim is not None:
+            raise TypeError(f"{op} 不接受 dim")
+        if op != "expand" and size is not None:
+            raise TypeError(f"{op} 不接受 size")
+        if op != "reshape" and shape is not None:
+            raise TypeError(f"{op} 不接受 shape")
+
+        unary = {"transpose", "clone", "sum", "expand", "reshape"}
+        if op in unary:
+            if y is not None:
+                raise TypeError(f"{op} 只接受一个 Value；dim/size 等配置请使用关键字")
+        elif op == "scale":
+            if isinstance(y, bool) or not isinstance(y, (int, float)):
+                raise TypeError("scale 需要 int 或 float 系数")
+            y = float(y)
+        elif not isinstance(y, Value):
+            raise TypeError(f"{op} 需要两个 Value")
+
+        normalized_dim = dim
+        if op == "sum" and dim is not None:
+            normalized_dim = _normalize_dim(dim, x.meta.ndim)
+        elif op == "expand":
+            if dim is None or size is None:
+                raise TypeError("expand 必须提供 dim 和 size")
+            normalized_dim = _normalize_dim(dim, x.meta.ndim, insert=True)
+            _check_size(size)
+        target = None
+        if op == "reshape":
+            if shape is None:
+                raise TypeError("reshape 必须提供 shape")
+            target = _check_shape(shape)
+            if prod(target) != x.meta.numel:
+                raise ValueError(f"reshape 元素数不匹配：{x.shape} → {target}")
+        options = OpOptions(normalized_dim, size, keepdim, target)
+        # 入参验证先于建图；no_grad 与正常模式执行相同的检查。
+        return self.redispatch(op, x, y, options=options, exclude=frozenset())
 
     def redispatch(
-        self, op: str, x: Value, y: Value | float | None = None, *, exclude: frozenset[str]
+        self, op: str, x: Value, y: Value | float | None = None, *,
+        options: OpOptions, exclude: frozenset[str],
     ) -> Value:
         if op not in self.operator:
             raise NotImplementedError(f"不支持 Value 算子 {op}")
@@ -437,17 +667,24 @@ class Dispatch:
             if key not in exclude:
                 if self._trace:
                     print(f"Dispatcher: {op} → {key}；排除 {sorted(exclude)}")
-                return self.layers[key](op, x, y, exclude)
+                return self.layers[key](op, x, y, options, exclude)
         raise RuntimeError(f"{op} 没有可用处理层，已排除 {sorted(exclude)}")
 
-    
+
 _dispatch = Dispatch()
 
 
 class AutogradEngine:
     """梯度收齐后统一调用 Node.apply；梯度缓冲区属于本次反向任务。"""
 
-    def run_backward(self, output: Node, seed: Value, *, create_graph: bool = False,_trace:bool = False) -> None:
+    def run_backward(
+        self,
+        output: Node,
+        seed: Value,
+        *,
+        create_graph: bool = False,
+        _trace: bool = False,
+    ) -> None:
         # 默认反向临时关闭建图；create_graph=True 则临时开启。
         # 无论调用者外面的梯度模式是什么，退出后都会恢复。
         with set_grad_enabled(create_graph):
@@ -462,7 +699,9 @@ class AutogradEngine:
             while ready:
                 node = ready.popleft()
                 grad_out = grad_buffers.pop(node)
-                self._evaluate_function(node, grad_out, pending, grad_buffers, ready,_trace)
+                self._evaluate_function(
+                    node, grad_out, pending, grad_buffers, ready, _trace
+                )
 
     def _collect_nodes(self, output: Node) -> list[Node]:
         nodes: list[Node] = []
@@ -492,7 +731,7 @@ class AutogradEngine:
         pending: dict[Node, int],
         grad_buffers: dict[Node, Value],
         ready: deque[Node],
-        _trace :bool
+        _trace: bool,
     ) -> None:
         if _trace:
             print(f"\n执行 {node.name}：上游梯度 {grad_out}")
@@ -518,11 +757,13 @@ class AutogradEngine:
 
 _engine = AutogradEngine()
 
+
 class Optime:
-    def __init__(self,params: Iterator[Parameter],lr: float ) -> None:
-        # 将迭代器转换成链表
+    def __init__(self, params: Iterator[Parameter], lr: float) -> None:
+        # 将迭代器转换成列表
         self.params = list(params)
-        if lr is None: 
+
+        if lr is None:
             raise RuntimeError("请设置学习率")
 
         self.lr = lr
@@ -543,10 +784,14 @@ class Optime:
                 with no_grad():
                     updata = param - param.grad * self.lr
                     param.data[:] = updata.data
-        
+
 
 def backward(
-    output: Value, seed: Value | None = None, *, create_graph: bool = False,_trace:bool = False,
+    output: Value,
+    seed: Value | None = None,
+    *,
+    create_graph: bool = False,
+    _trace: bool = False,
 ) -> None:
     if not output.require_grad or output.node is None:
         raise RuntimeError("当前 Value 没有可用的反向入口")
@@ -558,40 +803,51 @@ def backward(
         raise TypeError("seed 必须是 Value；单元素输出可以省略 seed 或传入 None")
     if seed.shape != output.shape:
         raise ValueError(f"seed.shape={seed.shape} 与输出形状 {output.shape} 不一致")
-    _engine.run_backward(output.node, seed, create_graph=create_graph,_trace=_trace)
+    _engine.run_backward(output.node, seed, create_graph=create_graph, _trace=_trace)
+
 
 class Parameter(Value):
     """标记：这是模型参数，而不是普通的中间计算结果。"""
+
     pass
 
+
 class module:
-    _parameters: dict[str,Parameter]
+    _parameters: dict[str, Parameter]
 
     def __init__(self, name: str) -> None:
-        object.__setattr__(self,"_parameters",{})
+        object.__setattr__(self, "_parameters", {})
         self.name = name
 
     def __setattr__(self, name: str, value: object) -> None:
         parameter = self.__dict__.get("_parameters")
-        if isinstance(value,Parameter):
+        if isinstance(value, Parameter):
             if parameter is None:
                 raise RuntimeError("请先调用super().__init__()")
             parameter[name] = value
         elif parameter is not None:
-            parameter.pop(name,None)
+            parameter.pop(name, None)
 
-        object.__setattr__(self,name,value)
+        object.__setattr__(self, name, value)
 
     def parameter(self) -> Iterator[Parameter]:
-        return iter(dict.fromkeys(self._parameters.values()))
+        seen: set[int] = set()
+        for param in self._parameters.values():
+            identity = id(param)
+
+            if identity in seen:
+                continue
+
+            seen.add(identity)
+            yield param
 
     def forward(self, input: Value) -> Value:
         return input
-    
+
     def __call__(self, input: Value) -> Value:
         return self.forward(input)
-    
-    
+
+
 class myModulde(module):
     def __init__(self, name: str) -> None:
         super().__init__(name)
@@ -601,12 +857,30 @@ class myModulde(module):
     def forward(self, input: Value) -> Value:
         # (1,2) @ (2,3) @ (3,2) → (1,2)，随后对整个矩阵数乘。
         self.hidden1 = input @ self.x
-        self.hidden2 =  (self.hidden1 @ self.y) * 0.5
+        self.hidden2 = (self.hidden1 @ self.y) * 0.5
         return self.hidden2 @ self.hidden2.T
 
 
 def main() -> None:
     _dispatch._trace = False
+
+    print("=== sum / expand 示例 ===")
+    x = Value(_Meta([1, 2, 3, 4, 5, 6], (2, 3)), name="x")
+    row_sum = x.sum(dim=1)
+    print("删除归约维：", row_sum)
+    print("保留归约维：", x.sum(dim=-1, keepdim=True))
+    print("插入并复制维度：", row_sum.expand(dim=1, size=3))
+    row_sum.backward(Value(_Meta([2, 3], (2,)), require_grad=False))
+    print("x.grad：", x.grad)  # [[2,2,2], [3,3,3]]
+
+    z = Value(_Meta([1, 2, 3, 4, 5, 6], (2, 3)), name="z")
+    loss = (z * z).sum()
+    loss.backward(create_graph=True)
+    first = z.grad
+    assert first is not None
+    z.grad = None
+    first.sum().backward()
+    print("平方和的二阶结果：", z.grad)  # 全部为 2
 
     print("=== 原来的矩阵示例：普通 backward 不记录梯度计算 ===")
     # 创建模型
@@ -614,9 +888,9 @@ def main() -> None:
     # 创建输入
     input = Value(_Meta([1, 2], [1, 2]), name="input", require_grad=False)
     # 得到输出
-    
+
     # 初始化一个优化器
-    opt = Optime(model.parameter(),lr = 0.001)
+    opt = Optime(model.parameter(), lr=0.001)
     # 清空梯度
 
     for _ in range(10):
@@ -628,7 +902,9 @@ def main() -> None:
         print("output:", output)
 
         # 反向传播
-        output.backward(Value(_Meta.ones_like(output.meta), require_grad=False),_trace = False)
+        output.backward(
+            Value(_Meta.ones_like(output.meta), require_grad=False), _trace=False
+        )
 
         # 使用梯度更新权重
         opt.step()
