@@ -1,7 +1,7 @@
-"""学习阶段 15：通用 Linear 与带标签的回归训练。
+"""学习阶段 16：可组合 mean 与可继续求导的 sqrt。
 
 运行：python experiments/mini_torch.py
-Xavier uniform 初始化、零偏置、输出层不加 ReLU；固定随机种子的回归演示验证损失下降。
+sqrt(0) 前向为零；零点反向按现有严格除零约定报错。LayerNorm 使用正 epsilon 避开零点。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -283,6 +283,7 @@ class CPUBackend(Backend):
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {
+            "sqrt": self.sqrt,
             "add": self.add,
             "sub": self.sub,
             "mul": self.mul,
@@ -298,6 +299,10 @@ class CPUBackend(Backend):
             "exponential": self.exponential,
             "relu": self.relu,
         }
+
+    def sqrt(self, x: _Meta) -> _Meta:
+        _check_sqrt_input(x)
+        return _Meta([math.sqrt(v) for v in x.data], x.shape)
 
 
 class GPUBackend(Backend):
@@ -490,6 +495,16 @@ class Value:
     def __repr__(self) -> str:
         return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
 
+    def mean(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
+        axis = None if dim is None else _normalize_dim(dim, self.meta.ndim)
+        count = self.meta.numel if axis is None else (self.shape[axis] if self.shape else 1)
+        if count == 0:
+            raise ValueError("当前教学版不对长度为零的轴求平均")
+        return self.sum(dim, keepdim=keepdim) * (1.0 / count)
+
+    def sqrt(self) -> Value:
+        return _dispatch.call("sqrt", self)
+
 
 class Autograd:
     """前向和反向的 Value 运算共用此层，是否建图由当前梯度模式决定。"""
@@ -536,6 +551,11 @@ class Autograd:
                     lambda grad_out: (grad_out * saved["save"].exp(),),
                     name=f"ExpBackward({x.name})",
                 )
+            elif op == "sqrt":
+                saved = {"input": x.clone()}
+                node = InnerNode([x.node],
+                    lambda g: (g / (saved["input"].sqrt() * 2.0),),
+                    data=saved, name=f"SqrtBackward({x.name})")
             elif op == "log":
                 saved = {"input": x.clone()}
                 node = InnerNode(
@@ -712,6 +732,8 @@ class ExecuteLayer:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
+        if op == "sqrt":
+            return kernel(x)
         if op in ("transpose", "clone", "exponential", "relu", "log"):
             return kernel(x)
         if op == "sum":
@@ -733,6 +755,7 @@ class Dispatch:
         self._trace = _trace
         self.operator = frozenset(
             {
+                "sqrt",
                 "add",
                 "sub",
                 "mul",
@@ -790,6 +813,7 @@ class Dispatch:
             raise TypeError(f"{op} 不接受 shape")
 
         unary = {
+            "sqrt",
             "transpose",
             "clone",
             "sum",
@@ -808,6 +832,9 @@ class Dispatch:
             y = float(y)
         elif not isinstance(y, Value):
             raise TypeError(f"{op} 需要两个 Value")
+
+        if op == "sqrt":
+            _check_sqrt_input(x.meta)
 
         # 与 no_grad 使用相同的定义域检查，且检查失败时不创建反向图。
         if op == "div":
@@ -1077,23 +1104,22 @@ class Linear(Module):
 
 
 
+def _check_sqrt_input(x: _Meta) -> None:
+    if any(not value >= 0 for value in x.data):
+        raise ValueError("sqrt 的实数输入必须大于或等于零")
+
+
 def main() -> None:
-    rng = random.Random(7)
-    first, last = Linear(2, 8, rng=rng), Linear(8, 1, rng=rng)
-    x = Value(_Meta([-1,-1, -1,1, 1,-1, 1,1], (4,2)), require_grad=False)
-    target = Value(_Meta([1.5,-4.5,5.5,-.5], (4,1)), require_grad=False)
-    opt = SGD(iter([*first.parameters(), *last.parameters()]), lr=0.04)
-    history = []
-    for _ in range(120):
-        opt.zero_grad()
-        pred = last(first(x).relu())
-        diff = pred - target
-        loss = (diff * diff).sum() * 0.25
-        history.append(loss.data[0])
-        loss.backward()
-        opt.step()
-    assert history[-1] < history[0] * 0.1
-    print("回归 MSE：", history[0], "→", history[-1])
+    x = Value(_Meta([1,4,9], (3,)), name="x")
+    x.sqrt().mean().backward(create_graph=True)
+    first = x.grad
+    assert first is not None
+    print("sqrt 均值的一阶梯度：", first.data)
+    x.grad = None
+    first.sum().backward()
+    expected = [-1/(12 * v**1.5) for v in x.data]
+    assert all(math.isclose(a,b) for a,b in zip(x.grad.data, expected, strict=True))
+    print("二阶梯度：", x.grad.data)
 
 
 if __name__ == "__main__":
