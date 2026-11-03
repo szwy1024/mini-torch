@@ -1,7 +1,8 @@
-"""学习阶段 13：用已有可微算子组合显式广播。
+"""学习阶段 14：递归 Module、共享参数去重及 SGD。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch13.py；替换长训练演示为确定性广播验证，子模块完善留到下一提交。
+修复任意层级遍历、属性删除清理；debug 标签不递归复制整个计算表达式。
+纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from math import prod
 from math import exp, log
+import math
+import random
 from typing import Callable, Generator, Sequence
 from typing import Iterator
 
@@ -694,23 +697,11 @@ class ExecuteLayer:
             "gpu": gpu.get_ability(),
         }
 
-    def apply(
-        self,
-        op: str,
-        x: Value,
-        y: Value | float | None,
-        options: OpOptions,
-        excluded: frozenset[str],
-    ) -> Value:
+    def apply(self, op: str, x: Value, y: Value | float | None,
+              options: OpOptions, excluded: frozenset[str]) -> Value:
         argument = y.meta if isinstance(y, Value) else y
         result = self.call_kernel(op, x.meta, argument, options=options)
-        if op in ("sum", "expand", "reshape"):
-            name = f"{op}({x.name}, {options})"
-        else:
-            label = y.name if isinstance(y, Value) else str(y)
-            name = f"{op}({x.name})" if y is None else f"{op}({x.name}, {label})"
-        # CPU 层只包装数值，不决定最终输出是否需要梯度。
-        return Value(result, name=name, require_grad=False)
+        return Value(result, name=op, require_grad=False)
 
     def call_kernel(
         self, op: str, x: _Meta, y: _Meta | float | None = None, *, options: OpOptions
@@ -951,32 +942,30 @@ class AutogradEngine:
 _engine = AutogradEngine()
 
 
-class Optime:
-    def __init__(self, params: Iterator[Parameter], lr: float) -> None:
-        # 将迭代器转换成列表
-        self.params = list(params)
+class SGD:
+    """只更新不同的叶子参数；保持 Parameter 对象和存储身份不变。"""
+    def __init__(self, params: Iterator[Parameter], lr: float = 0.01) -> None:
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError("lr 必须是有限正数")
+        self.params = list(dict.fromkeys(params))
+        if any(not isinstance(p, Parameter) or not p.require_grad or not isinstance(p.node, LeafNode) for p in self.params):
+            raise TypeError("SGD 只接受需要梯度的叶子 Parameter")
+        self.lr = float(lr)
 
-        if lr is None:
-            raise RuntimeError("请设置学习率")
-
-        self.lr = lr
-
-    def zero_grad(self):
-        """清空梯度"""
-        if self.params is None:
-            raise RuntimeError("请先初始化参数列表")
+    def zero_grad(self) -> None:
         for param in self.params:
             param.grad = None
 
-    def step(self):
-        """更新梯度"""
-        if self.params is None:
-            raise RuntimeError("请先初始化参数列表")
-        for param in self.params:
-            if param.grad is not None:
-                with no_grad():
-                    updata = param - param.grad * self.lr
-                    param.data[:] = updata.data
+    def step(self) -> None:
+        with no_grad():
+            for param in self.params:
+                if param.grad is not None:
+                    if param.grad.shape != param.shape:
+                        raise ValueError("参数和梯度形状不一致")
+                    param.data[:] = (param - param.grad * self.lr).data
+
+
+Optime = SGD  # 兼容旧阶段的教学命名。
 
 
 def backward(
@@ -1035,30 +1024,17 @@ class Module:
     def parameter(self) -> Iterator[Parameter]:
         seen_params: set[int] = set()
         seen_modules: set[int] = set()
-
-        moudles:deque[Module]  =deque([self])
-
-        def _get_parameter(module:Module)-> Iterator[Parameter]:
-            # 获取模块中的参数
-            for param in module._parameters.values():
-                identity = id(param)
-
-                if identity in seen_params:
-                    continue
-
-                seen_params.add(identity)
-                yield param
-
-        # 只要队列不空，出栈一个module，如果这个module没被访问过
-        # 获取它的全部参数，处理它包含的子module
-        while moudles:
-            module = moudles.popleft()
-            identity = id(module)
-            if identity in seen_modules:
+        queue: deque[Module] = deque([self])
+        while queue:
+            module = queue.popleft()
+            if id(module) in seen_modules:
                 continue
-            seen_modules.add(identity)
-            yield from _get_parameter(module)
-            moudles.extend(module._modules.values())
+            seen_modules.add(id(module))
+            for param in module._parameters.values():
+                if id(param) not in seen_params:
+                    seen_params.add(id(param))
+                    yield param
+            queue.extend(module._modules.values())
 
 
     def forward(self, input: Value) -> Value:
@@ -1066,6 +1042,14 @@ class Module:
 
     def __call__(self, input: Value) -> Value:
         return self.forward(input)
+
+    def parameters(self) -> Iterator[Parameter]:
+        return self.parameter()
+
+    def __delattr__(self, name: str) -> None:
+        object.__delattr__(self, name)
+        self._parameters.pop(name, None)
+        self._modules.pop(name, None)
 
 
 class Liner(Module):
@@ -1095,11 +1079,16 @@ class myModule(Module):
         return  self.hidden4 
 
 def main() -> None:
-    x = Value(_Meta([1,2,3], (3,)), name="bias")
-    y = x.broadcast_to((2,3))
-    y.backward(Value(_Meta([1,2,3,4,5,6], (2,3)), require_grad=False))
-    assert y.data == [1,2,3,1,2,3] and x.grad.data == [5,7,9]
-    print("广播结果：", y.data, "原形状梯度：", x.grad.data)
+    root = Module("root")
+    root.child = Module("child")
+    root.child.weight = Parameter(_Meta([2], ()), name="weight")
+    root.alias = root.child.weight
+    assert len(list(root.parameters())) == 1
+    opt = SGD(root.parameters(), lr=0.1)
+    (root.child.weight * root.child.weight).backward()
+    opt.step()
+    assert abs(root.child.weight.data[0] - 1.6) < 1e-12
+    print("嵌套参数去重与 SGD：", root.child.weight.data)
 
 
 if __name__ == "__main__":
