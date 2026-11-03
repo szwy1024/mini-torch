@@ -1,7 +1,7 @@
-"""学习阶段 16：可组合 mean 与可继续求导的 sqrt。
+"""学习阶段 17：组合实现 LayerNorm。
 
 运行：python experiments/mini_torch.py
-sqrt(0) 前向为零；零点反向按现有严格除零约定报错。LayerNorm 使用正 epsilon 避开零点。
+按最后一维归一化，使用总体方差；gamma/beta 由递归参数系统注册。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -1109,17 +1109,37 @@ def _check_sqrt_input(x: _Meta) -> None:
         raise ValueError("sqrt 的实数输入必须大于或等于零")
 
 
+class LayerNorm(Module):
+    def __init__(self, features: int, eps: float = 1e-5) -> None:
+        super().__init__("LayerNorm")
+        if type(features) is not int or features <= 0:
+            raise ValueError("features 必须是正整数")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not math.isfinite(eps) or eps <= 0:
+            raise ValueError("eps 必须是有限正数")
+        self.features, self.eps = features, float(eps)
+        self.weight = Parameter(_Meta([1] * features, (features,)), name="gamma")
+        self.bias = Parameter(_Meta([0] * features, (features,)), name="beta")
+
+    def forward(self, x: Value) -> Value:
+        if not x.shape or x.shape[-1] != self.features:
+            raise ValueError("LayerNorm 的输入末维不匹配")
+        centered = x - x.mean(-1, keepdim=True).broadcast_to(x.shape)
+        variance = (centered * centered).mean(-1, keepdim=True)
+        epsilon = Value(_Meta([self.eps] * variance.meta.numel, variance.shape), require_grad=False)
+        normalized = centered / (variance + epsilon).sqrt().broadcast_to(x.shape)
+        return normalized * self.weight.broadcast_to(x.shape) + self.bias.broadcast_to(x.shape)
+
+
 def main() -> None:
-    x = Value(_Meta([1,4,9], (3,)), name="x")
-    x.sqrt().mean().backward(create_graph=True)
-    first = x.grad
-    assert first is not None
-    print("sqrt 均值的一阶梯度：", first.data)
-    x.grad = None
-    first.sum().backward()
-    expected = [-1/(12 * v**1.5) for v in x.data]
-    assert all(math.isclose(a,b) for a,b in zip(x.grad.data, expected, strict=True))
-    print("二阶梯度：", x.grad.data)
+    norm = LayerNorm(3)
+    x = Value(_Meta([1,2,3, 2,2,2], (2,3)), name="x")
+    y = norm(x)
+    assert all(math.isfinite(v) for v in y.data)
+    assert y.data[3:] == [0,0,0]
+    (y * y).sum().backward()
+    assert x.grad is not None and all(p.grad is not None for p in norm.parameters())
+    print("LayerNorm：", y.data)
+    print("gamma 梯度：", norm.weight.grad.data)
 
 
 if __name__ == "__main__":
