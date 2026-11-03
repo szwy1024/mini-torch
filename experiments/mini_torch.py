@@ -1,7 +1,7 @@
-"""学习阶段 02：分离 Value 与反向 Node。
+"""学习阶段 03：统一 Node.apply 与叶子梯度累加。
 
 运行：python experiments/mini_torch.py
-补建说明：源自 pytorch2.py；修复 right 拼写、require_grad 与输出 node 关联，清空每次内部节点梯度。
+补建说明：源自 pytorch3.py；Engine 临时缓冲区与叶子 .grad 分离。
 """
 
 from __future__ import annotations
@@ -11,190 +11,221 @@ from typing import Callable
 
 
 class Node:
-    def __init__(self,
-        value : Value|None,
-    ) -> None: 
+    """共同接口：反向边 + 接收上游梯度的 apply 方法。"""
+
+    def __init__(self, edge: list[Node | None], name: str) -> None:
+        self.edge = edge
+        self.name = name
+
+    def apply(self, grad_out: float) -> tuple[float, ...]:
+        raise NotImplementedError("具体节点必须实现自己的反向行为")
+
+
+class LeafNode(Node):
+    """相当于简化的 AccumulateGrad：把收到的梯度累加到目标叶子 Value。"""
+
+    def __init__(self, value: Value) -> None:
+        if not value.require_grad:
+            raise ValueError("不需要梯度的 Value 不应创建 LeafNode")
+        super().__init__(edge=[], name=f"LeafNode({value.name})")
         self.value = value
 
-# 叶子结点，负责将梯度传递给value
-class LeafNode(Node):
-    def __init__(self,
-        value : Value|None,
-    ) -> None: 
-        super().__init__(value)
+    def apply(self, grad_out: float) -> tuple[float, ...]:
+        before = self.value.grad
+        self.value.grad += grad_out
+        print(
+            f"  累加到叶子 {self.value.name}.grad："
+            f"{before:g} + {grad_out:g} = {self.value.grad:g}"
+        )
+        return ()  # 没有更早的反向节点，传播到此结束。
 
-# 中间结点，负责保存收集梯度
+
 class InnerNode(Node):
-    def __init__(self,
-        edge : list[Node|None],                          # 反向边
-        value : Value|None,
-        backrule : Callable[[float],tuple[float,...]],   # 反向求导的方法
-        data : dict[str,float] | None = None             # 需要的数据
-    ) -> None: 
-        super().__init__(value)
-        self.edge = edge
+    """根据局部求导规则，返回与每条输入边对应的梯度贡献。"""
+
+    def __init__(
+        self,
+        edge: list[Node | None],
+        backrule: Callable[[float], tuple[float, ...]],
+        data: dict[str, float] | None = None,
+        name: str = "InnerNode",
+    ) -> None:
+        super().__init__(edge=edge, name=name)
         self.backrule = backrule
-        self.data = data   
-        self.grad = 0.0
+        self.data = {} if data is None else data
+        # 不保存输出 Value，也不在这里保存一次任务的累计梯度。
+
+    def apply(self, grad_out: float) -> tuple[float, ...]:
+        return self.backrule(grad_out)
+
 
 class Value:
-    def __init__(self, data: float, name: str | None = None,
-                 require_grad: bool = True, node: Node | None = None):
+    def __init__(
+        self,
+        data: float,
+        name: str | None = None,
+        require_grad: bool = True,
+        node: Node | None = None,
+    ) -> None:
+        if node is not None and not require_grad:
+            raise ValueError("关闭梯度的 Value 不应关联反向节点")
         self.data = float(data)
         self.name = name
         self.grad = 0.0
         self.require_grad = require_grad
-        self.node = node if node is not None else (LeafNode(self) if require_grad else None)
+        self.node: Node | None = node
+        if require_grad and node is None:
+            self.node = LeafNode(self)
 
     def __add__(self, other: Value) -> Value:
-        left, right = self.data, other.data
-        requires = self.require_grad or other.require_grad
-        value = Value(self.data + other.data, name="result", require_grad=requires)
-        if requires:
-            value.node = InnerNode([self.node, other.node], value,
-                                   lambda g: (g, g))
-        return value
+        require_grad = self.require_grad or other.require_grad
+        node: Node | None = None
+        if require_grad:
+            node = InnerNode(
+                edge=[self.node, other.node],
+                backrule=lambda grad_out: (grad_out, grad_out),
+                name=f"AddBackward({self.name}, {other.name})",
+            )
+        return Value(
+            self.data + other.data,
+            name=f"({self.name}+{other.name})",
+            require_grad=require_grad,
+            node=node,
+        )
 
     def __mul__(self, other: Value) -> Value:
-        left, right = self.data, other.data
-        requires = self.require_grad or other.require_grad
-        value = Value(left * right, name="result", require_grad=requires)
-        if requires:
-            value.node = InnerNode([self.node, other.node], value,
-                                   lambda g: (g * right, g * left))
-        return value
+        saved = {"left": self.data, "right": other.data}
+        require_grad = self.require_grad or other.require_grad
+        node: Node | None = None
+        if require_grad:
+            node = InnerNode(
+                edge=[self.node, other.node],
+                data=saved,
+                backrule=lambda grad_out: (
+                    grad_out * saved["right"],
+                    grad_out * saved["left"],
+                ),
+                name=f"MulBackward({self.name}, {other.name})",
+            )
+        return Value(
+            saved["left"] * saved["right"],
+            name=f"({self.name}*{other.name})",
+            require_grad=require_grad,
+            node=node,
+        )
 
-    
-    def backward(self,seed: float = 1.0) -> None:
-        """用户入口：对应 Tensor.backward，只把请求交给模块级接口。"""
-        backward(self,seed)
+    def backward(self, seed: float = 1.0) -> None:
+        backward(self, seed)
 
 
 class AutogradEngine:
-    """单线程教学引擎：只管理图和调度，不定义加减乘除的导数。
-
-    每次 run_backward 都有独立的 nodes、pending 和 ready。
-    为方便观察，仍保留所有中间节点的 grad，并在每次运行前清空。
-    这与 PyTorch 默认的“叶子梯度累加、中间梯度不保留”有所不同。
-    """
+    """统一调度两种 Node；梯度收齐后调用 apply，无需对节点类型做分支。"""
 
     def run_backward(self, output: Node, seed: float) -> None:
-        """执行一次反向传播；对应真实引擎的运行入口。"""
-        if isinstance(output, LeafNode):
-            raise RuntimeError("无法对叶子结点调用反向传播")
+        nodes = self._collect_nodes(output)
+        pending = self._compute_dependencies(nodes)
+        # 临时梯度属于本次任务，不能沿用上一次反向传播留下的中间梯度。
+        grad_buffers = {node: 0.0 for node in nodes}
+        grad_buffers[output] = seed
+        ready: deque[Node] = deque([output])
 
-        if isinstance(output,InnerNode) :
-            nodes = self._collect_nodes(output)
-            pending = self._compute_dependencies(nodes)
-            for n in nodes:
-                if isinstance(n, InnerNode):
-                    n.grad = 0.0
+        print("\n=== 反向前：等待的梯度贡献数 ===")
+        for node in nodes:
+            print(f"{node.name}: {pending[node]} 份")
 
-            # 从根节点开始。seed 是传给当前输出的初始上游梯度。
-            output.grad = seed
-            ready: deque[Node] = deque([output])
+        print("\n=== AutogradEngine：就绪队列调度 ===")
+        while ready:
+            node = ready.popleft()
+            grad_out = grad_buffers.pop(node)
+            self._evaluate_function(node, grad_out, pending, grad_buffers, ready)
 
-            print("\n=== AutogradEngine：就绪队列调度 ===")
-            while ready:
-                node = ready.popleft()
-                self._evaluate_function(node, pending, ready)
-
-    def _collect_nodes(self, output: InnerNode) -> list[Node]:
-        """图遍历：只收集参与本次反向传播的节点，共享节点只收集一次。"""
+    def _collect_nodes(self, output: Node) -> list[Node]:
         nodes: list[Node] = []
         seen: set[Node] = set()
         stack: list[Node] = [output]
         while stack:
             node = stack.pop()
-            if node in seen :
+            if node in seen:
                 continue
             seen.add(node)
             nodes.append(node)
-            # 获取node结点关联的边
-            if isinstance(node,InnerNode):
-                stack.extend([edge for edge in node.edge if edge is not None])
+            stack.extend(edge for edge in node.edge if edge is not None)
         return nodes
 
     def _compute_dependencies(self, nodes: list[Node]) -> dict[Node, int]:
-        """依赖统计：每个节点还需要收齐多少条边的梯度贡献。"""
         pending = {node: 0 for node in nodes}
         for node in nodes:
-            if isinstance(node,InnerNode):
-                for edge in node.edge:
-                    if edge is not None:
-                        pending[edge] += 1
+            for edge in node.edge:
+                if edge is not None:
+                    pending[edge] += 1
         return pending
 
     def _evaluate_function(
         self,
         node: Node,
+        grad_out: float,
         pending: dict[Node, int],
-        ready: deque[Node]
+        grad_buffers: dict[Node, float],
+        ready: deque[Node],
     ) -> None:
-        """执行一个就绪节点的规则，并把梯度贡献传给它的输入节点。"""
-        
-        # 引擎不必知道这是乘法还是除法，只需调用该节点自己的求导规则。
-        if isinstance(node,InnerNode):
-            contributions = node.backrule(node.grad)
-            for edge, (edge, contribution) in enumerate(
-                zip(node.edge, contributions, strict=True), start=1
-            ):
-                if isinstance(edge,InnerNode):
-                    edge.grad += contribution
-                    pending[edge] -= 1
-                
-                    if pending[edge] == 0:
-                        ready.append(edge)
-                if isinstance(edge ,LeafNode):
-                    edge.value.grad +=contribution 
-        
-# 引擎本身可以复用；一次反向传播的队列和依赖计数存在 run_backward 的局部变量中。
+        print(f"\n执行 {node.name}：收到完整上游梯度 {grad_out:g}")
+        contributions = node.apply(grad_out)
+        for slot, (edge, contribution) in enumerate(
+            zip(node.edge, contributions, strict=True), start=1
+        ):
+            if edge is None:
+                continue  # 该输入关闭梯度，但它的数值仍可能用于求另一输入的导数。
+            before = grad_buffers[edge]
+            grad_buffers[edge] += contribution
+            pending[edge] -= 1
+            print(
+                f"  输入边 {slot} → {edge.name}："
+                f"累计 {before:g} + {contribution:g} = {grad_buffers[edge]:g}；"
+                f"还等 {pending[edge]} 份"
+            )
+            if pending[edge] == 0:
+                ready.append(edge)
+
+
 _engine = AutogradEngine()
 
 
 def backward(output: Value, seed: float = 1.0) -> None:
-    """模块级接口：对应 torch.autograd.backward，检查并准备参数后调用引擎。"""
     if not output.require_grad:
-        raise RuntimeError("当前节点不需要梯度，不能调用 backward 方法")
+        raise RuntimeError("当前 Value 不需要梯度，不能调用 backward")
+    if output.node is None:
+        raise RuntimeError("需要梯度的 Value 缺少反向入口")
     _engine.run_backward(output.node, float(seed))
 
 
 class module:
-    def __init__(
-        self,
-        name:str,
-    ):
-        self.name=name
+    def __init__(self, name: str) -> None:
+        self.name = name
 
-    # 继承的模块中需要重写的前向计算方法
-    def forward(self,input:Value)->Value:
+    def forward(self, input: Value) -> Value:
         return input
 
-    # 可以直接使用模块名调用
-    def __call__(self, input:Value) -> Value:
+    def __call__(self, input: Value) -> Value:
         return self.forward(input)
 
-    
-# 定义自己的神经网络模型
-class myModulde(module):
-    def __init__(self, name: str):
-        super().__init__(name)
-        self.x = Value(10,name="x")
-        self.y = Value(4,name="y")
-        self.z = Value(5,name="z")
 
-    def forward(self, input: Value):
+class myModulde(module):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.x = Value(2, name="x")
+        self.y = Value(4, name="y")
+        self.z = Value(5, name="z")
+
+    def forward(self, input: Value) -> Value:
         a = input * input
         a.name = "a"
-
         b = a * self.x
         b.name = "b"
-
-        c = input * self.y
+        c = input * self.y * a * b
         c.name = "c"
 
-
         return c
+
 
 def main() -> None:
     x = Value(2, name="x")
@@ -203,8 +234,6 @@ def main() -> None:
     y.backward()
     assert y.data == 14 and x.grad == 13 and w.grad == 4
     print("y=", y.data, "dx=", x.grad, "dw=", w.grad)
-
-
 
 if __name__ == "__main__":
     main()
