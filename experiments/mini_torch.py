@@ -1,7 +1,7 @@
-"""学习阶段 04：张量元数据与逐元素数值派发。
+"""学习阶段 05：独立 Storage、矩阵乘法与数乘。
 
 运行：python experiments/mini_torch.py
-补建说明：第 4 版原稿标量与张量接口混用；依据第 5 版的已完成实现补齐本阶段，仅保留逐元素运算。
+补建说明：源自 pytorch5.py；元数据、存储及二维 matmul 求导。
 """
 
 from __future__ import annotations
@@ -11,21 +11,31 @@ from math import prod
 from typing import Callable, Sequence
 
 
+class Storage:
+    """实际数值。教学简化：用 list[float]，而不是底层字节缓冲区。"""
 
+    def __init__(self, data: Sequence[float]) -> None:
+        self.data = [float(value) for value in data]
 
 
 class _Meta:
     """数值张量描述：存储 + 形状；不包含自动微分信息。"""
 
     def __init__(self, data: Sequence[float], shape: Sequence[int]) -> None:
+        # 固定形状，避免外部修改传入的 shape 列表影响已有张量。
         self.shape = tuple(shape)
         if any(type(dim) is not int or dim < 0 for dim in self.shape):
-            raise ValueError("shape 必须由非负整数组成")
-        self.data = [float(v) for v in data]
+            raise ValueError("shape 的各维长度必须是非负整数")
+        self.storage = Storage(data)
         if len(self.data) != self.numel:
-            raise ValueError("数据长度与 shape 不匹配")
+            raise ValueError(
+                f"数据长度 {len(self.data)} 与 shape={self.shape} "
+                f"需要的元素数 {self.numel} 不一致"
+            )
 
-
+    @property
+    def data(self) -> list[float]:
+        return self.storage.data
 
     @property
     def numel(self) -> int:
@@ -72,9 +82,33 @@ class Dispatch:
         """矩阵或张量的数乘，scalar 是普通 Python 常数。"""
         return _Meta([value * scalar for value in x.data], x.shape)
 
+    def matmul(self, x: _Meta, y: _Meta) -> _Meta:
+        """(m, k) @ (k, n) → (m, n)，仅支持二维矩阵。"""
+        if len(x.shape) != 2 or len(y.shape) != 2:
+            raise ValueError("matmul 当前只支持两个二维矩阵")
+        m, k = x.shape
+        other_k, n = y.shape
+        if k != other_k:
+            raise ValueError(f"矩阵内维不匹配：{x.shape} @ {y.shape}")
+        result = [0.0] * (m * n)
+        for row in range(m):
+            for col in range(n):
+                # 行优先：x[row, inner] 和 y[inner, col] 的一维下标。
+                result[row * n + col] = sum(
+                    x.data[row * k + inner] * y.data[inner * n + col]
+                    for inner in range(k)
+                )
+        return _Meta(result, (m, n))
 
-
-
+    def transpose(self, x: _Meta) -> _Meta:
+        """二维转置，返回独立的数据副本，不创建共享存储的视图。"""
+        if len(x.shape) != 2:
+            raise ValueError("transpose 当前只支持二维矩阵")
+        rows, cols = x.shape
+        return _Meta(
+            [x.data[row * cols + col] for col in range(cols) for row in range(rows)],
+            (cols, rows),
+        )
 
 
 _dispatch = Dispatch()
@@ -145,7 +179,9 @@ class Value:
         if require_grad and node is None:
             self.node = LeafNode(self)
 
-
+    @property
+    def storage(self) -> Storage:
+        return self.meta.storage
 
     @property
     def data(self) -> list[float]:
@@ -216,7 +252,23 @@ class Value:
     def __rmul__(self, scalar: float | int) -> Value:
         return self * scalar
 
-
+    def __matmul__(self, other: Value) -> Value:
+        result = _dispatch.matmul(self.meta, other.meta)
+        require_grad = self.require_grad or other.require_grad
+        node = None
+        if require_grad:
+            saved = {"left": self.meta.clone(), "right": other.meta.clone()}
+            node = InnerNode(
+                [self.node, other.node],
+                # C=A@B，G=dL/dC：dL/dA=G@B.T，dL/dB=A.T@G。
+                lambda grad_out: (
+                    _dispatch.matmul(grad_out, _dispatch.transpose(saved["right"])),
+                    _dispatch.matmul(_dispatch.transpose(saved["left"]), grad_out),
+                ),
+                data=saved,
+                name=f"MatmulBackward({self.name}, {other.name})",
+            )
+        return Value(result, f"({self.name}@{other.name})", require_grad, node)
 
     def backward(self, seed: _Meta | None = None) -> None:
         backward(self, seed)
@@ -318,15 +370,31 @@ class module:
         return self.forward(input)
 
 
+class myModulde(module):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.x = Value(_Meta([1, 2, 3, 4, 5, 6], [2, 3]), name="x")
+        self.y = Value(_Meta([2, 3, 4, 5, 6, 7], [3, 2]), name="y")
 
+    def forward(self, input: Value) -> Value:
+        # (1,2) @ (2,3) @ (3,2) → (1,2)，随后对整个矩阵数乘。
+        hidden = input @ self.x
+        hidden.name = "hidden"
+        return (hidden @ self.y) * 0.5
 
 
 def main() -> None:
-    x = Value(_Meta([1, 2, 3, 4], (2, 2)), name="x")
-    y = x * x + x
-    y.backward(_Meta.ones_like(y.meta))
-    assert y.data == [2, 6, 12, 20] and x.grad.data == [3, 5, 7, 9]
-    print("逐元素结果：", y.data, "梯度：", x.grad.data)
+    print("=== 前向：矩阵乘法与数乘 ===")
+    model = myModulde("m1")
+    input = Value(_Meta([1, 2], [1, 2]), name="input", require_grad=False)
+    output = model(input)
+    print("output:", output.meta)
+    # 用全 1 的上游梯度，表示对所有输出元素之和求导。
+    output.backward(_Meta.ones_like(output.meta))
+    print("\n=== 结果 ===")
+    print("input.grad:", input.grad)
+    print("x.grad:", model.x.grad)
+    print("y.grad:", model.y.grad)
 
 
 if __name__ == "__main__":
