@@ -1,7 +1,7 @@
-"""学习阶段 20：FFN、残差连接与完整 Transformer Block。
+"""学习阶段 21：Embedding、位置编码、交叉熵与自回归训练。
 
 运行：python experiments/mini_torch.py
-全部由已实现的可微操作组合；递归参数遍历覆盖 LayerNorm、Attention 和 FFN。
+固定小词表循环序列，纯 Python 拟合下一 token；不依赖 torch，也不声称具备真实语言泛化能力。
 纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
 """
 
@@ -1257,15 +1257,106 @@ class TransformerBlock(Module):
         return h + self.ffn(self.norm2(h))
 
 
+def _check_tokens(tokens: Sequence[int], vocab_size: int) -> list[int]:
+    result = list(tokens)
+    if not result or any(type(token) is not int or not 0 <= token < vocab_size for token in result):
+        raise ValueError("token 序列非空，每个 token 必须是词表范围内的整数")
+    return result
+
+
+class Embedding(Module):
+    """用 one-hot @ weight 展示嵌入查表的可微等价实现，暂不优化索引开销。"""
+    def __init__(self, vocab_size: int, d_model: int, *, rng: random.Random | None = None) -> None:
+        super().__init__("Embedding")
+        if type(vocab_size) is not int or vocab_size <= 0 or type(d_model) is not int or d_model <= 0:
+            raise ValueError("词表和嵌入维度必须是正整数")
+        generator = rng if rng is not None else random
+        self.vocab_size, self.d_model = vocab_size, d_model
+        self.weight = Parameter(_Meta([generator.uniform(-.5,.5) for _ in range(vocab_size*d_model)],
+                                     (vocab_size,d_model)), name="embedding")
+
+    def forward(self, tokens: Sequence[int]) -> Value:
+        tokens = _check_tokens(tokens, self.vocab_size)
+        one_hot = [float(token == col) for token in tokens for col in range(self.vocab_size)]
+        return Value(_Meta(one_hot, (len(tokens),self.vocab_size)), require_grad=False) @ self.weight
+
+
+class PositionalEncoding(Module):
+    def __init__(self, d_model: int, max_seq_len: int) -> None:
+        super().__init__("PositionalEncoding")
+        if type(d_model) is not int or d_model <= 0 or type(max_seq_len) is not int or max_seq_len <= 0:
+            raise ValueError("位置编码维度和最大长度必须是正整数")
+        self.d_model, self.max_seq_len = d_model, max_seq_len
+
+    def forward(self, x: Value) -> Value:
+        if len(x.shape) != 2 or x.shape[1] != self.d_model or not 0 < x.shape[0] <= self.max_seq_len:
+            raise ValueError("位置编码输入形状或长度不匹配")
+        values = [(math.sin if j%2 == 0 else math.cos)(pos / (10000 ** (2*(j//2)/self.d_model)))
+                  for pos in range(x.shape[0]) for j in range(self.d_model)]
+        return x + Value(_Meta(values, x.shape), require_grad=False)
+
+
+def cross_entropy(logits: Value, targets: Sequence[int]) -> Value:
+    if len(logits.shape) != 2 or logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("交叉熵需要非空 (序列长度, 词表大小) logits")
+    if not all(math.isfinite(v) for v in logits.data):
+        raise ValueError("交叉熵 logits 必须是有限值")
+    labels = _check_tokens(targets, logits.shape[1])
+    if len(labels) != logits.shape[0]:
+        raise ValueError("标签数与 logits 的序列长度不匹配")
+    one_hot = Value(_Meta([float(label == col) for label in labels for col in range(logits.shape[1])],
+                          logits.shape), require_grad=False)
+    return (logits.log_softmax(-1) * one_hot).sum() * (-1.0 / len(labels))
+
+
+class TinyTransformerLM(Module):
+    def __init__(self, vocab_size: int, d_model: int = 4, d_ff: int = 8,
+                 max_seq_len: int = 16, num_layers: int = 1, seed: int = 42) -> None:
+        super().__init__("TinyTransformerLM")
+        if type(num_layers) is not int or num_layers <= 0:
+            raise ValueError("num_layers 必须是正整数")
+        rng = random.Random(seed)
+        self.embedding = Embedding(vocab_size, d_model, rng=rng)
+        self.position = PositionalEncoding(d_model, max_seq_len)
+        self.block_names = tuple(f"block_{i}" for i in range(num_layers))
+        for name in self.block_names:
+            setattr(self, name, TransformerBlock(d_model, d_ff, rng=rng))
+        self.norm = LayerNorm(d_model)
+        self.head = Linear(d_model, vocab_size, rng=rng)
+        self.max_seq_len, self.vocab_size = max_seq_len, vocab_size
+
+    def forward(self, tokens: Sequence[int]) -> Value:
+        x = self.position(self.embedding(tokens))
+        for name in self.block_names:
+            x = getattr(self, name)(x)
+        return self.head(self.norm(x))
+
+    def generate(self, context: Sequence[int], steps: int) -> list[int]:
+        result = _check_tokens(context, self.vocab_size)
+        if type(steps) is not int or steps < 0:
+            raise ValueError("生成步数必须是非负整数")
+        with no_grad():
+            for _ in range(steps):
+                scores = self(result[-self.max_seq_len:]).data[-self.vocab_size:]
+                result.append(max(range(self.vocab_size), key=lambda i: scores[i]))
+        return result
+
+
 def main() -> None:
-    block = TransformerBlock(4, 8, rng=random.Random(9))
-    x = Value(_Meta([.1,.2,.3,.4, .2,.5,-.2,.8, .4,.3,.2,-.1], (3,4)))
-    y = block(x)
-    assert y.shape == x.shape
-    (y * y).mean().backward()
-    params = list(block.parameters())
-    assert len(params) == 16 and all(p.grad is not None for p in params)
-    print("Transformer Block 输出形状：", y.shape, "参数张量数：", len(params))
+    model = TinyTransformerLM(3)
+    tokens, targets = [0,1,2,0,1,2], [1,2,0,1,2,0]
+    optimizer = SGD(model.parameters(), lr=0.05)
+    losses = []
+    for step in range(60):
+        optimizer.zero_grad()
+        loss = cross_entropy(model(tokens), targets)
+        losses.append(loss.data[0])
+        loss.backward()
+        optimizer.step()
+        if step in (0,19,39,59):
+            print(f"step={step:02d} cross_entropy={loss.data[0]:.6f}")
+    assert losses[-1] < losses[0] * 0.5
+    print("greedy tokens：", model.generate([0,1,2], 6))
 
 
 if __name__ == "__main__":
