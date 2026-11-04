@@ -9,8 +9,7 @@ from math import exp, log
 import math
 import random
 from itertools import product as cartesian_product
-from typing import Callable, Generator, Sequence
-from typing import Iterator
+from typing import Any, Callable, Generator, Generic, Iterator, Sequence, TypeVar
 
 # ContextVar 保存当前执行上下文的状态，嵌套或异常退出时用 token 恢复。
 _grad_enabled: ContextVar[bool] = ContextVar("grad_enabled", default=True)
@@ -1025,9 +1024,14 @@ class Parameter(Value):
     pass
 
 
-class Module:
+# 不同模块接收不同类型的输入：Linear 接收 Value，Embedding 接收 token 序列。
+InputT = TypeVar("InputT", contravariant=True)
+TokenInput = Sequence[int] | Sequence[Sequence[int]]
+
+
+class Module(Generic[InputT]):
     _parameters: dict[str, Parameter]
-    _modules: dict[str,Module]
+    _modules: dict[str, Module[Any]]  # 注册表只遍历子模块，不调用它们的 forward。
 
     def __init__(self, name: str) -> None:
         object.__setattr__(self, "_parameters", {})
@@ -1055,7 +1059,7 @@ class Module:
     def parameter(self) -> Iterator[Parameter]:
         seen_params: set[int] = set()
         seen_modules: set[int] = set()
-        queue: deque[Module] = deque([self])
+        queue: deque[Module[Any]] = deque([self])
         while queue:
             module = queue.popleft()
             if id(module) in seen_modules:
@@ -1068,10 +1072,10 @@ class Module:
             queue.extend(module._modules.values())
 
 
-    def forward(self, input: Value) -> Value:
-        return input
+    def forward(self, input: InputT, /) -> Value:
+        raise NotImplementedError("子模块需要实现 forward")
 
-    def __call__(self, input: Value) -> Value:
+    def __call__(self, input: InputT, /) -> Value:
         return self.forward(input)
 
     def parameters(self) -> Iterator[Parameter]:
@@ -1083,7 +1087,7 @@ class Module:
         self._modules.pop(name, None)
 
 
-class Linear(Module):
+class Linear(Module[Value]):
     """任意正整数输入/输出维度；末维做投影，显式广播偏置。"""
     def __init__(self, in_features: int, out_features: int, *, bias: bool = True,
                  rng: random.Random | None = None) -> None:
@@ -1110,7 +1114,7 @@ def _check_sqrt_input(x: _Meta) -> None:
         raise ValueError("sqrt 的实数输入必须大于或等于零")
 
 
-class LayerNorm(Module):
+class LayerNorm(Module[Value]):
     def __init__(self, features: int, eps: float = 1e-5) -> None:
         super().__init__("LayerNorm")
         if features <= 0 or eps <= 0:
@@ -1181,7 +1185,7 @@ def causal_mask(length: int) -> Value:
                        (length, length)), name="causal_mask", require_grad=False)
 
 
-class CausalSelfAttention(Module):
+class CausalSelfAttention(Module[Value]):
     def __init__(self, d_model: int, *, num_heads: int = 1, rng: random.Random | None = None) -> None:
         super().__init__("CausalSelfAttention")
         if num_heads <= 0 or d_model % num_heads:
@@ -1210,7 +1214,7 @@ class CausalSelfAttention(Module):
         return result.reshape((length,self.d_model)) if unbatched else result
 
 
-class FeedForward(Module):
+class FeedForward(Module[Value]):
     def __init__(self, d_model: int, d_ff: int, *, rng: random.Random | None = None) -> None:
         super().__init__("FeedForward")
         self.up = Linear(d_model, d_ff, rng=rng)
@@ -1220,7 +1224,7 @@ class FeedForward(Module):
         return self.down(self.up(x).relu())
 
 
-class TransformerBlock(Module):
+class TransformerBlock(Module[Value]):
     """Pre-LN：残差支路形状不变，FFN 末层不使用 ReLU。"""
     def __init__(self, d_model: int, d_ff: int, *, num_heads: int = 1,
                  rng: random.Random | None = None) -> None:
@@ -1241,7 +1245,7 @@ def _check_tokens(tokens: Sequence[int], vocab_size: int) -> list[int]:
     return result
 
 
-class Embedding(Module):
+class Embedding(Module[TokenInput]):
     """用 one-hot @ weight 展示嵌入查表的可微等价实现，暂不优化索引开销。"""
     def __init__(self, vocab_size: int, d_model: int, *, rng: random.Random | None = None) -> None:
         super().__init__("Embedding")
@@ -1252,13 +1256,13 @@ class Embedding(Module):
         self.weight = Parameter(_Meta([generator.uniform(-.5,.5) for _ in range(vocab_size*d_model)],
                                      (vocab_size,d_model)), name="embedding")
 
-    def forward(self, tokens: Sequence[int] | Sequence[Sequence[int]]) -> Value:
+    def forward(self, tokens: TokenInput) -> Value:
         flat, shape = _token_layout(tokens, self.vocab_size)
         one_hot = [float(token == col) for token in flat for col in range(self.vocab_size)]
         return Value(_Meta(one_hot, shape + (self.vocab_size,)), require_grad=False) @ self.weight
 
 
-class PositionalEncoding(Module):
+class PositionalEncoding(Module[Value]):
     def __init__(self, d_model: int, max_seq_len: int) -> None:
         super().__init__("PositionalEncoding")
         if d_model <= 0 or max_seq_len <= 0:
@@ -1275,7 +1279,7 @@ class PositionalEncoding(Module):
         return x + positions.broadcast_to(x.shape)
 
 
-def cross_entropy(logits: Value, targets: Sequence[int] | Sequence[Sequence[int]]) -> Value:
+def cross_entropy(logits: Value, targets: TokenInput) -> Value:
     if len(logits.shape) not in (2,3) or any(n == 0 for n in logits.shape):
         raise ValueError("交叉熵需要非空 (T,V) 或 (B,T,V) logits")
     if not all(math.isfinite(v) for v in logits.data):
@@ -1288,7 +1292,7 @@ def cross_entropy(logits: Value, targets: Sequence[int] | Sequence[Sequence[int]
     return (logits.log_softmax(-1) * one_hot).sum() * (-1.0 / len(labels))
 
 
-class TinyTransformerLM(Module):
+class TinyTransformerLM(Module[TokenInput]):
     def __init__(self, vocab_size: int, d_model: int = 4, d_ff: int = 8,
                  max_seq_len: int = 16, num_layers: int = 1, seed: int = 42,
                  num_heads: int = 1) -> None:
@@ -1305,7 +1309,7 @@ class TinyTransformerLM(Module):
         self.head = Linear(d_model, vocab_size, rng=rng)
         self.max_seq_len, self.vocab_size = max_seq_len, vocab_size
 
-    def forward(self, tokens: Sequence[int] | Sequence[Sequence[int]]) -> Value:
+    def forward(self, tokens: TokenInput) -> Value:
         x = self.position(self.embedding(tokens))
         for name in self.block_names:
             x = getattr(self, name)(x)
@@ -1357,15 +1361,17 @@ def _flat_offset(index: Sequence[int], shape: tuple[int, ...]) -> int:
     return offset
 
 
-def _token_layout(tokens: Sequence[int] | Sequence[Sequence[int]], vocab_size: int) -> tuple[list[int], tuple[int, ...]]:
+def _token_layout(tokens: TokenInput, vocab_size: int) -> tuple[list[int], tuple[int, ...]]:
     rows = list(tokens)
     if not rows:
         raise ValueError("token 输入不能为空")
-    if all(type(token) is int for token in rows):
-        return _check_tokens(rows, vocab_size), (len(rows),)
-    if not all(isinstance(row, (list, tuple)) for row in rows):
+    flat = [token for token in rows if isinstance(token, int)]
+    if len(flat) == len(rows):
+        return _check_tokens(flat, vocab_size), (len(rows),)
+    sequences = [row for row in rows if isinstance(row, Sequence)]
+    if len(sequences) != len(rows):
         raise ValueError("token 必须是整数序列或等长的二维整数序列")
-    checked = [_check_tokens(row, vocab_size) for row in rows]
+    checked = [_check_tokens(row, vocab_size) for row in sequences]
     width = len(checked[0])
     if any(len(row) != width for row in checked):
         raise ValueError("batch 中的序列长度必须相同；当前不做 padding")
