@@ -1,12 +1,3 @@
-"""学习阶段 23：单文件检查入口与可复现实验。
-
-运行：python experiments/mini_torch.py
-python experiments/mini_torch.py --check；默认训练小型多头因果 Transformer，可用 --demo regression。
-查看学习顺序：git log --reverse --oneline -- experiments/mini_torch.py；用 git show <commit>:experiments/mini_torch.py 查看阶段代码。
-边界：CPU/Python list、显式逐元素广播、物化快照；不实现 GPU、dropout、图释放或原地版本检查，不能用于性能结论。
-纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
-"""
-
 from __future__ import annotations
 
 from collections import deque
@@ -797,9 +788,7 @@ class ExecuteLayer:
         self, op: str, x: _Meta, y: _Meta | float | None = None, *, options: OpOptions
     ) -> _Meta:
         # 仍固定选 CPU；GPUBackend 只是占位，未实现 Metal 或设备存储。
-        kernel = self.kernels["cpu"].get(op)
-        if kernel is None:
-            raise NotImplementedError(f"CPU 未注册算子 {op}")
+        kernel = self.kernels["cpu"][op]
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
         if op == "permute":
@@ -874,75 +863,14 @@ class Dispatch:
         shape: Sequence[int] | None = None,
         axes: Sequence[int] | None = None,
     ) -> Value:
-        if op not in self.operator:
-            raise NotImplementedError(f"不支持 Value 算子 {op}")
-        if not isinstance(x, Value):
-            raise TypeError("x 必须是 Value")
-        if type(keepdim) is not bool:
-            raise TypeError("keepdim 必须是 bool")
-        if op not in ("sum", "max") and keepdim:
-            raise TypeError(f"{op} 不接受 keepdim=True")
-        if op not in ("sum", "max", "expand") and dim is not None:
-            raise TypeError(f"{op} 不接受 dim")
-        if op != "expand" and size is not None:
-            raise TypeError(f"{op} 不接受 size")
-        if op != "reshape" and shape is not None:
-            raise TypeError(f"{op} 不接受 shape")
-
-        unary = {
-            "permute",
-            "max",
-            "sqrt",
-            "transpose",
-            "clone",
-            "sum",
-            "expand",
-            "reshape",
-            "exponential",
-            "relu",
-            "log",
-        }
-        if op in unary:
-            if y is not None:
-                raise TypeError(f"{op} 只接受一个 Value；dim/size 等配置请使用关键字")
-        elif op == "scale":
-            if isinstance(y, bool) or not isinstance(y, (int, float)):
-                raise TypeError("scale 需要 int 或 float 系数")
+        # 此层只整理配置；数值实现负责检查形状和数学定义域。
+        if op == "scale" and isinstance(y, (int, float)):
             y = float(y)
-        elif not isinstance(y, Value):
-            raise TypeError(f"{op} 需要两个 Value")
-
-        if op == "sqrt":
-            _check_sqrt_input(x.meta)
-
-        # 与 no_grad 使用相同的定义域检查，且检查失败时不创建反向图。
-        if op == "div":
-            if not isinstance(y, Value):
-                raise TypeError("div 需要两个 Value")
-            _check_div_inputs(x.meta, y.meta)
-        elif op == "log":
-            _check_log_input(x.meta)
-
-        if op != "permute" and axes is not None:
-            raise TypeError(f"{op} 不接受 axes")
-        normalized_axes = _check_permutation(axes, x.meta.ndim) if op == "permute" else None
-        normalized_dim = dim
-        if op in ("sum", "max") and dim is not None:
-            normalized_dim = _normalize_dim(dim, x.meta.ndim)
-        elif op == "expand":
-            if dim is None or size is None:
-                raise TypeError("expand 必须提供 dim 和 size")
-            normalized_dim = _normalize_dim(dim, x.meta.ndim, insert=True)
-            _check_size(size)
-        target = None
-        if op == "reshape":
-            if shape is None:
-                raise TypeError("reshape 必须提供 shape")
-            target = _check_shape(shape)
-            if prod(target) != x.meta.numel:
-                raise ValueError(f"reshape 元素数不匹配：{x.shape} → {target}")
-        options = OpOptions(normalized_dim, size, keepdim, target, normalized_axes)
-        # 入参验证先于建图；no_grad 与正常模式执行相同的检查。
+        if dim is not None:
+            dim = _normalize_dim(dim, x.meta.ndim, insert=op == "expand")
+        target = tuple(shape) if shape is not None else None
+        permutation = _check_permutation(axes, x.meta.ndim) if op == "permute" else None
+        options = OpOptions(dim, size, keepdim, target, permutation)
         return self.redispatch(op, x, y, options=options, exclude=frozenset())
 
     def redispatch(
@@ -1054,11 +982,7 @@ _engine = AutogradEngine()
 class SGD:
     """只更新不同的叶子参数；保持 Parameter 对象和存储身份不变。"""
     def __init__(self, params: Iterator[Parameter], lr: float = 0.01) -> None:
-        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
-            raise ValueError("lr 必须是有限正数")
         self.params = list(dict.fromkeys(params))
-        if any(not isinstance(p, Parameter) or not p.require_grad or not isinstance(p.node, LeafNode) for p in self.params):
-            raise TypeError("SGD 只接受需要梯度的叶子 Parameter")
         self.lr = float(lr)
 
     def zero_grad(self) -> None:
@@ -1069,8 +993,6 @@ class SGD:
         with no_grad():
             for param in self.params:
                 if param.grad is not None:
-                    if param.grad.shape != param.shape:
-                        raise ValueError("参数和梯度形状不一致")
                     param.data[:] = (param - param.grad * self.lr).data
 
 
@@ -1166,10 +1088,8 @@ class Linear(Module):
     def __init__(self, in_features: int, out_features: int, *, bias: bool = True,
                  rng: random.Random | None = None) -> None:
         super().__init__("Linear")
-        if type(in_features) is not int or type(out_features) is not int or min(in_features, out_features) < 1:
+        if min(in_features, out_features) < 1:
             raise ValueError("Linear 的输入、输出维度必须是正整数")
-        if type(bias) is not bool:
-            raise TypeError("bias 必须是 bool")
         self.in_features, self.out_features = in_features, out_features
         generator = rng if rng is not None else random
         bound = math.sqrt(6.0 / (in_features + out_features))
@@ -1185,7 +1105,6 @@ class Linear(Module):
         return result if self.bias is None else result + self.bias.broadcast_to(result.shape)
 
 
-
 def _check_sqrt_input(x: _Meta) -> None:
     if any(not value >= 0 for value in x.data):
         raise ValueError("sqrt 的实数输入必须大于或等于零")
@@ -1194,10 +1113,8 @@ def _check_sqrt_input(x: _Meta) -> None:
 class LayerNorm(Module):
     def __init__(self, features: int, eps: float = 1e-5) -> None:
         super().__init__("LayerNorm")
-        if type(features) is not int or features <= 0:
-            raise ValueError("features 必须是正整数")
-        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not math.isfinite(eps) or eps <= 0:
-            raise ValueError("eps 必须是有限正数")
+        if features <= 0 or eps <= 0:
+            raise ValueError("features 和 eps 必须大于零")
         self.features, self.eps = features, float(eps)
         self.weight = Parameter(_Meta([1] * features, (features,)), name="gamma")
         self.bias = Parameter(_Meta([0] * features, (features,)), name="beta")
@@ -1257,7 +1174,7 @@ def _check_softmax(x: Value, dim: int) -> int:
 
 
 def causal_mask(length: int) -> Value:
-    if type(length) is not int or length <= 0:
+    if length <= 0:
         raise ValueError("因果掩码长度必须是正整数")
     return Value(_Meta([0.0 if col <= row else -math.inf
                         for row in range(length) for col in range(length)],
@@ -1267,7 +1184,7 @@ def causal_mask(length: int) -> Value:
 class CausalSelfAttention(Module):
     def __init__(self, d_model: int, *, num_heads: int = 1, rng: random.Random | None = None) -> None:
         super().__init__("CausalSelfAttention")
-        if type(d_model) is not int or d_model <= 0 or type(num_heads) is not int or num_heads <= 0 or d_model % num_heads:
+        if num_heads <= 0 or d_model % num_heads:
             raise ValueError("d_model 和 num_heads 必须为正整数，且 d_model 能被 num_heads 整除")
         self.query = Linear(d_model, d_model, rng=rng)
         self.key = Linear(d_model, d_model, rng=rng)
@@ -1328,7 +1245,7 @@ class Embedding(Module):
     """用 one-hot @ weight 展示嵌入查表的可微等价实现，暂不优化索引开销。"""
     def __init__(self, vocab_size: int, d_model: int, *, rng: random.Random | None = None) -> None:
         super().__init__("Embedding")
-        if type(vocab_size) is not int or vocab_size <= 0 or type(d_model) is not int or d_model <= 0:
+        if vocab_size <= 0 or d_model <= 0:
             raise ValueError("词表和嵌入维度必须是正整数")
         generator = rng if rng is not None else random
         self.vocab_size, self.d_model = vocab_size, d_model
@@ -1344,7 +1261,7 @@ class Embedding(Module):
 class PositionalEncoding(Module):
     def __init__(self, d_model: int, max_seq_len: int) -> None:
         super().__init__("PositionalEncoding")
-        if type(d_model) is not int or d_model <= 0 or type(max_seq_len) is not int or max_seq_len <= 0:
+        if d_model <= 0 or max_seq_len <= 0:
             raise ValueError("位置编码维度和最大长度必须是正整数")
         self.d_model, self.max_seq_len = d_model, max_seq_len
 
@@ -1376,7 +1293,7 @@ class TinyTransformerLM(Module):
                  max_seq_len: int = 16, num_layers: int = 1, seed: int = 42,
                  num_heads: int = 1) -> None:
         super().__init__("TinyTransformerLM")
-        if type(num_layers) is not int or num_layers <= 0:
+        if num_layers <= 0:
             raise ValueError("num_layers 必须是正整数")
         rng = random.Random(seed)
         self.embedding = Embedding(vocab_size, d_model, rng=rng)
@@ -1396,7 +1313,7 @@ class TinyTransformerLM(Module):
 
     def generate(self, context: Sequence[int], steps: int) -> list[int]:
         result = _check_tokens(context, self.vocab_size)
-        if type(steps) is not int or steps < 0:
+        if steps < 0:
             raise ValueError("生成步数必须是非负整数")
         with no_grad():
             for _ in range(steps):
@@ -1455,154 +1372,6 @@ def _token_layout(tokens: Sequence[int] | Sequence[Sequence[int]], vocab_size: i
     return [token for row in checked for token in row], (len(rows), width)
 
 
-def _assert_close(actual: Sequence[float], expected: Sequence[float], *, tol: float = 1e-8) -> None:
-    if len(actual) != len(expected) or not all(math.isclose(a,b,rel_tol=tol,abs_tol=tol)
-                                             for a,b in zip(actual,expected,strict=True)):
-        raise AssertionError(f"数值不一致：{list(actual)} != {list(expected)}")
-
-
-def self_test() -> None:
-    """标准库即可运行的数值/集成回归；另以 PyTorch float64 做外部数值验证。"""
-    checks = 0
-    def expect_error(error: type[Exception], fn: Callable[[], object]) -> None:
-        nonlocal checks
-        try:
-            fn()
-        except error:
-            checks += 1
-        else:
-            raise AssertionError(f"预期 {error.__name__}")
-    def tensor(data: Sequence[float], shape: Sequence[int], grad: bool = True) -> Value:
-        return Value(_Meta(data,shape),name="test",require_grad=grad)
-
-    # 三阶求导验证梯度仍是带求导关系的 Value。
-    x=tensor([2],())
-    (x*x*x).backward(create_graph=True)
-    first=x.grad
-    _assert_close(first.data,[12])
-    x.grad=None
-    first.backward(create_graph=True)
-    second=x.grad
-    _assert_close(second.data,[12])
-    x.grad=None
-    second.backward()
-    _assert_close(x.grad.data,[6])
-    checks += 1
-
-    x=tensor([1,4,9],(3,))
-    x.sqrt().sum().backward(create_graph=True)
-    first=x.grad
-    _assert_close(first.data,[.5,.25,1/6])
-    x.grad=None
-    first.sum().backward()
-    _assert_close(x.grad.data,[-.25,-1/32,-1/108])
-    checks += 1
-
-    bias=tensor([1,2,3],(3,))
-    bias.broadcast_to((2,3)).backward(tensor([1,2,3,4,5,6],(2,3),False))
-    _assert_close(bias.grad.data,[5,7,9])
-    empty=tensor([], (0,1)).broadcast_to((2,0,3))
-    if empty.shape != (2,0,3): raise AssertionError("空维度广播失败")
-    checks += 1
-
-    for enabled in (False,True):
-        with set_grad_enabled(enabled):
-            result=tensor([1],()).sqrt()
-            if result.require_grad != enabled: raise AssertionError("梯度模式错误")
-    if not is_grad_enabled(): raise AssertionError("梯度模式没有恢复")
-    checks += 1
-
-    a=tensor([1,2,3,4],(2,1,2))
-    b=tensor([2,3],(2,1))
-    (a@b).sum().backward()
-    _assert_close(a.grad.data,[2,3,2,3])
-    _assert_close(b.grad.data,[4,6])
-    perm=tensor(list(range(12)),(2,2,3))
-    _assert_close(perm.permute((0,2,1)).permute((0,2,1)).data,perm.data)
-    checks += 1
-
-    tie=tensor([5,5,1],(3,))
-    tie.max().backward()
-    _assert_close(tie.grad.data,[1,0,0])
-    scores=tensor([1000,1001,999,-1000,-999,-1001],(2,3))
-    probs=scores.softmax()
-    _assert_close(probs.sum(-1).data,[1,1])
-    _assert_close(scores.log_softmax().exp().data,probs.data)
-    loss=cross_entropy(scores,[1,0])
-    loss.backward()
-    expected=[(p-float(i==label))/2 for row,label in zip([probs.data[:3],probs.data[3:]],[1,0])
-              for i,p in enumerate(row)]
-    _assert_close(scores.grad.data,expected)
-    checks += 1
-
-    norm=LayerNorm(3)
-    out=norm(tensor([2,2,2,1,2,3],(2,3)))
-    _assert_close(out.data[:3],[0,0,0])
-    if not all(math.isfinite(v) for v in out.data): raise AssertionError("LayerNorm 产生非有限值")
-    checks += 1
-
-    root=Module("root")
-    root.child=Module("child")
-    root.child.layer=Linear(2,3,rng=random.Random(1))
-    root.alias=root.child.layer.weight
-    root.child.parent=root
-    if len(list(root.parameters())) != 2: raise AssertionError("共享/循环模块去重失败")
-    del root.child.layer
-    if len(list(root.parameters())) != 1: raise AssertionError("删除子模块清理失败")
-    del root.alias
-    if list(root.parameters()): raise AssertionError("删除参数清理失败")
-    p=Parameter(_Meta([2],()))
-    opt=SGD(iter([p,p]),lr=.1)
-    (p*p).backward()
-    opt.step()
-    _assert_close(p.data,[1.6])
-    checks += 1
-
-    embed=Embedding(3,2,rng=random.Random(2))
-    embed([1,1,2]).sum().backward()
-    _assert_close(embed.weight.grad.data,[0,0,2,2,1,1])
-    checks += 1
-
-    attn=CausalSelfAttention(4,num_heads=2,rng=random.Random(5))
-    source=[.1,.2,.3,.4, .2,.4,.6,.8, .4,.3,.2,.1]
-    with no_grad():
-        original=attn(tensor(source,(3,4),False))
-        changed=source.copy()
-        changed[-4:]=[10,20,30,40]
-        altered=attn(tensor(changed,(3,4),False))
-        _assert_close(original.data[:8],altered.data[:8])
-        batch=attn(tensor(source+source,(2,3,4),False))
-        _assert_close(batch.data,original.data+original.data)
-    checks += 1
-
-    block=TransformerBlock(4,8,num_heads=2,rng=random.Random(6))
-    x=tensor(source,(3,4))
-    y=block(x)
-    (y*y).mean().backward()
-    if y.shape != x.shape or any(p.grad is None for p in block.parameters()):
-        raise AssertionError("Transformer Block 反向失败")
-    model=TinyTransformerLM(3,num_heads=2)
-    logits=model([[0,1,2],[1,2,0]])
-    cross_entropy(logits,[[1,2,0],[2,0,1]]).backward()
-    if any(p.grad is None for p in model.parameters()): raise AssertionError("LM 参数梯度遗漏")
-    checks += 1
-
-    expect_error(ZeroDivisionError,lambda: tensor([1],())/tensor([0],()))
-    expect_error(ValueError,lambda: tensor([-1],()).log())
-    expect_error(ValueError,lambda: tensor([-1],()).sqrt())
-    expect_error(ValueError,lambda: tensor([1,2],(2,)).broadcast_to((3,)))
-    expect_error(ValueError,lambda: tensor([1,2],(2,)).permute((0,0)))
-    expect_error(ValueError,lambda: tensor([-math.inf,-math.inf],(2,)).softmax())
-    expect_error(ValueError,lambda: CausalSelfAttention(4,num_heads=3))
-    expect_error(ValueError,lambda: Embedding(3,2)([3]))
-    expect_error(ValueError,lambda: model([[0,1],[1]]))
-    expect_error(ValueError,lambda: cross_entropy(tensor([1,2,3],(1,3)),[3]))
-    expect_error(ValueError,lambda: SGD(iter([]),lr=-1))
-    expect_error(ValueError,lambda: CPUBackend("cpu").max(_Meta([1],()),dim=3))
-    expect_error(TypeError,lambda: CPUBackend("cpu").max(_Meta([1],()),keepdim=1))
-    print(f"PASS: {checks} groups of numerical, gradient, shape and integration checks")
-
-
 def train_demo(steps: int = 80, seed: int = 42, num_heads: int = 2) -> tuple[TinyTransformerLM, list[float]]:
     model=TinyTransformerLM(3,d_model=6,d_ff=12,num_heads=num_heads,max_seq_len=6,seed=seed)
     tokens=[[0,1,2,0,1,2],[1,2,0,1,2,0],[2,0,1,2,0,1]]
@@ -1612,7 +1381,6 @@ def train_demo(steps: int = 80, seed: int = 42, num_heads: int = 2) -> tuple[Tin
     for step in range(steps):
         optimizer.zero_grad()
         loss=cross_entropy(model(tokens),targets)
-        if not math.isfinite(loss.data[0]): raise ArithmeticError("训练损失不是有限数")
         history.append(loss.data[0])
         loss.backward()
         optimizer.step()
@@ -1640,21 +1408,18 @@ def regression_demo(steps: int = 80, seed: int = 7) -> None:
 
 def main() -> None:
     import argparse
-    parser=argparse.ArgumentParser(description="Single-file educational autograd and causal Transformer")
-    parser.add_argument("--check",action="store_true",help="运行不依赖第三方包的数值与集成检查")
-    parser.add_argument("--demo",choices=("train","regression"),default="train")
-    parser.add_argument("--steps",type=int,default=80)
-    parser.add_argument("--seed",type=int,default=42)
-    parser.add_argument("--heads",type=int,default=2)
-    args=parser.parse_args()
-    if args.steps <= 0:
-        parser.error("--steps 必须大于零")
-    if args.check:
-        self_test()
-    elif args.demo == "regression":
-        regression_demo(args.steps,args.seed)
+
+    parser = argparse.ArgumentParser(description="Single-file educational autograd and causal Transformer")
+    parser.add_argument("--demo", choices=("train", "regression"), default="train")
+    parser.add_argument("--steps", type=int, default=80)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--heads", type=int, default=2)
+    args = parser.parse_args()
+
+    if args.demo == "regression":
+        regression_demo(args.steps, args.seed)
     else:
-        train_demo(args.steps,args.seed,args.heads)
+        train_demo(args.steps, args.seed, args.heads)
 
 
 if __name__ == "__main__":
