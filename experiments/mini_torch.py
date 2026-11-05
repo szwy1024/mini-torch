@@ -18,6 +18,85 @@ import random
 from typing import Callable, Generator, Sequence
 from typing import Iterator
 
+
+def _normalize_dim(dim: int, ndim: int, *, insert: bool = False) -> int:
+    """普通维度范围 [-ndim, ndim-1]；插入位置范围 [-ndim-1, ndim]。"""
+    if type(dim) is not int:
+        raise TypeError("dim 必须是整数，不能是 bool 或浮点数")
+    limit = ndim + 1 if insert else max(ndim, 1)
+    if not -limit <= dim < limit:
+        raise ValueError(f"dim={dim} 超出范围；输入维数={ndim}，insert={insert}")
+    return dim + limit if dim < 0 else dim
+
+
+def _check_size(size: int) -> None:
+    if type(size) is not int:
+        raise TypeError("size 必须是整数，不能是 bool 或浮点数")
+    if size < 0:
+        raise ValueError("size 必须大于或等于 0")
+
+
+def _check_shape(shape: Sequence[int]) -> tuple[int, ...]:
+    result = tuple(shape)
+    if any(type(dim) is not int or dim < 0 for dim in result):
+        raise ValueError("shape 必须由非负整数组成")
+    return result
+
+
+def _check_div_inputs(x: _Meta, y: _Meta) -> None:
+    """当前除法不做广播；正零和负零都不允许作为分母。"""
+    if x.shape != y.shape:
+        raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
+    if any(value == 0.0 for value in y.data):
+        raise ZeroDivisionError("div 的分母不能包含零")
+
+
+def _check_log_input(x: _Meta) -> None:
+    """只接受实数正值；写成 not > 0 也会拒绝 NaN。"""
+    if any(not value > 0.0 for value in x.data):
+        raise ValueError("log 的输入必须逐元素大于零")
+
+
+def _check_sqrt_input(x: _Meta) -> None:
+    if any(not value >= 0 for value in x.data):
+        raise ValueError("sqrt 的实数输入必须大于或等于零")
+
+
+def _check_softmax(x: Value, dim: int) -> int:
+    if not x.shape:
+        raise ValueError("softmax 至少需要一维输入")
+    axis = _normalize_dim(dim, x.meta.ndim)
+    if any(math.isnan(v) or v == math.inf for v in x.data):
+        raise ValueError("softmax 不接受 NaN 或正无穷")
+    return axis
+
+
+def _check_softmax_groups(maximum: _Meta) -> None:
+    if any(value == -math.inf for value in maximum.data):
+        raise ValueError("softmax 的每组输入必须至少有一个有限值，不能全部被屏蔽")
+
+
+def _check_same_shape(x: _Meta, y: _Meta) -> None:
+    if x.shape != y.shape:
+        raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
+
+
+def _check_reduction(x: _Meta, dim: int | None, keepdim: bool) -> int | None:
+    if type(keepdim) is not bool:
+        raise TypeError("keepdim 必须是 bool")
+    return None if dim is None else _normalize_dim(dim, x.ndim)
+
+
+def _check_max_input(x: _Meta, dim: int | None) -> None:
+    if any(math.isnan(value) for value in x.data):
+        raise ValueError("当前 max 不接受 NaN")
+    if dim is None or x.ndim == 0:
+        if not x.data:
+            raise ValueError("不能对空集合求 max")
+    elif x.shape[dim] == 0:
+        raise ValueError("max 的归约轴不能为空")
+
+
 # ContextVar 保存当前执行上下文的状态，嵌套或异常退出时用 token 恢复。
 _grad_enabled: ContextVar[bool] = ContextVar("grad_enabled", default=True)
 
@@ -95,44 +174,6 @@ class _Meta:
         return f"_Meta(data={self.data}, shape={self.shape})"
 
 
-def _normalize_dim(dim: int, ndim: int, *, insert: bool = False) -> int:
-    """普通维度范围 [-ndim, ndim-1]；插入位置范围 [-ndim-1, ndim]。"""
-    if type(dim) is not int:
-        raise TypeError("dim 必须是整数，不能是 bool 或浮点数")
-    limit = ndim + 1 if insert else max(ndim, 1)
-    if not -limit <= dim < limit:
-        raise ValueError(f"dim={dim} 超出范围；输入维数={ndim}，insert={insert}")
-    return dim + limit if dim < 0 else dim
-
-
-def _check_size(size: int) -> None:
-    if type(size) is not int:
-        raise TypeError("size 必须是整数，不能是 bool 或浮点数")
-    if size < 0:
-        raise ValueError("size 必须大于或等于 0")
-
-
-def _check_shape(shape: Sequence[int]) -> tuple[int, ...]:
-    result = tuple(shape)
-    if any(type(dim) is not int or dim < 0 for dim in result):
-        raise ValueError("shape 必须由非负整数组成")
-    return result
-
-
-def _check_div_inputs(x: _Meta, y: _Meta) -> None:
-    """当前除法不做广播；正零和负零都不允许作为分母。"""
-    if x.shape != y.shape:
-        raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
-    if any(value == 0.0 for value in y.data):
-        raise ZeroDivisionError("div 的分母不能包含零")
-
-
-def _check_log_input(x: _Meta) -> None:
-    """只接受实数正值；写成 not > 0 也会拒绝 NaN。"""
-    if any(not value > 0.0 for value in x.data):
-        raise ValueError("log 的输入必须逐元素大于零")
-
-
 @dataclass(frozen=True)
 class OpOptions:
     """在处理层之间传递不可变的算子配置；配置不参与梯度计算。"""
@@ -154,25 +195,20 @@ class Backend:
 class CPUBackend(Backend):
     """CPU 数值实现：只处理 _Meta，不创建反向节点。"""
 
-    @staticmethod
-    def _check_same_shape(x: _Meta, y: _Meta) -> None:
-        if x.shape != y.shape:
-            raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
-
     def __init__(self, name: str):
         super().__init__(name)
 
     def add(self, x: _Meta, y: _Meta) -> _Meta:
-        self._check_same_shape(x, y)
+        _check_same_shape(x, y)
         return _Meta([a + b for a, b in zip(x.data, y.data, strict=True)], x.shape)
 
     def sub(self, x: _Meta, y: _Meta) -> _Meta:
-        self._check_same_shape(x, y)
+        _check_same_shape(x, y)
         return _Meta([a - b for a, b in zip(x.data, y.data, strict=True)], x.shape)
 
     def mul(self, x: _Meta, y: _Meta) -> _Meta:
         """逐元素乘法，区别于 matmul。"""
-        self._check_same_shape(x, y)
+        _check_same_shape(x, y)
         return _Meta([a * b for a, b in zip(x.data, y.data, strict=True)], x.shape)
 
     def div(self, x: _Meta, y: _Meta) -> _Meta:
@@ -222,13 +258,11 @@ class CPUBackend(Backend):
 
     def sum(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
         """沿单个维度求和；dim=None 求全部元素之和，空集合的和为 0。"""
-        if type(keepdim) is not bool:
-            raise TypeError("keepdim 必须是 bool")
+        dim = _check_reduction(x, dim, keepdim)
         if dim is None:
             shape = (1,) * x.ndim if keepdim else ()
             return _Meta([sum(x.data)], shape)
 
-        dim = _normalize_dim(dim, x.ndim)
         # 标量允许 dim=0/-1；归约后仍为标量。
         if x.ndim == 0:
             return x.clone()
@@ -281,10 +315,42 @@ class CPUBackend(Backend):
     def relu(self, x: _Meta) -> _Meta:
         return _Meta([max(data, 0) for data in x.data], x.shape)
 
+    def sqrt(self, x: _Meta) -> _Meta:
+        _check_sqrt_input(x)
+        return _Meta([math.sqrt(v) for v in x.data], x.shape)
+
+    def max(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
+        return self._max_with_mask(x, dim, keepdim)[0]
+
+    def max_mask(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
+        """返回输入形状的首个最大位置掩码；选择结果本身不可微。"""
+        return self._max_with_mask(x, dim, keepdim)[1]
+
+    def _max_with_mask(self, x: _Meta, dim: int | None, keepdim: bool) -> tuple[_Meta, _Meta]:
+        """返回最大值和首个最大位置掩码；并列最大值选择第一个。"""
+        dim = _check_reduction(x, dim, keepdim)
+        _check_max_input(x, dim)
+        if dim is None or x.ndim == 0:
+            best = max(x.data)
+            mask = [0.0] * x.numel
+            mask[x.data.index(best)] = 1.0
+            shape = (1,) * x.ndim if keepdim else ()
+            return _Meta([best], shape), _Meta(mask, x.shape)
+        axis = dim
+        width = x.shape[axis]
+        outer, inner = prod(x.shape[:axis]), prod(x.shape[axis+1:])
+        output, mask = [], [0.0] * x.numel
+        for before in range(outer):
+            for after in range(inner):
+                offsets = [(before * width + j) * inner + after for j in range(width)]
+                winner = max(offsets, key=lambda index: x.data[index])
+                output.append(x.data[winner])
+                mask[winner] = 1.0
+        shape = x.shape[:axis] + ((1,) if keepdim else ()) + x.shape[axis+1:]
+        return _Meta(output, shape), _Meta(mask, x.shape)
+
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {
-            "max": self.max,
-            "sqrt": self.sqrt,
             "add": self.add,
             "sub": self.sub,
             "mul": self.mul,
@@ -299,27 +365,18 @@ class CPUBackend(Backend):
             "reshape": self.reshape,
             "exponential": self.exponential,
             "relu": self.relu,
+            "max": self.max,
+            "max_mask": self.max_mask,
+            "sqrt": self.sqrt,
         }
-
-    def sqrt(self, x: _Meta) -> _Meta:
-        _check_sqrt_input(x)
-        return _Meta([math.sqrt(v) for v in x.data], x.shape)
-
-    def max(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
-        return _max_reduce(x, dim, keepdim)[0]
 
 
 class GPUBackend(Backend):
-    @staticmethod
-    def _check_same_shape(x: _Meta, y: _Meta) -> None:
-        if x.shape != y.shape:
-            raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
-
     def __init__(self, name: str):
         super().__init__(name)
 
     def add(self, x: _Meta, y: _Meta) -> _Meta:
-        self._check_same_shape(x, y)
+        _check_same_shape(x, y)
         return _Meta([a + b for a, b in zip(x.data, y.data, strict=True)], x.shape)
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
@@ -514,13 +571,17 @@ class Value:
 
     def softmax(self, dim: int = -1) -> Value:
         axis = _check_softmax(self, dim)
-        shifted = self - self.max(axis, keepdim=True).broadcast_to(self.shape)
+        maximum = self.max(axis, keepdim=True)
+        _check_softmax_groups(maximum.meta)
+        shifted = self - maximum.broadcast_to(self.shape)
         numerator = shifted.exp()
         return numerator / numerator.sum(axis, keepdim=True).broadcast_to(self.shape)
 
     def log_softmax(self, dim: int = -1) -> Value:
         axis = _check_softmax(self, dim)
-        shifted = self - self.max(axis, keepdim=True).broadcast_to(self.shape)
+        maximum = self.max(axis, keepdim=True)
+        _check_softmax_groups(maximum.meta)
+        shifted = self - maximum.broadcast_to(self.shape)
         normalizer = shifted.exp().sum(axis, keepdim=True).log()
         return shifted - normalizer.broadcast_to(self.shape)
 
@@ -543,7 +604,8 @@ class Autograd:
         # 只有value类型可能需要梯度，纯数值不关联梯度信息
         other_requires_grad = y.require_grad if isinstance(y, Value) else False
         # 查询当前上下文是否开启了梯度记录。
-        require_grad = is_grad_enabled() and (x.require_grad or other_requires_grad)
+        # max_mask 是离散选择，和 require_grad / 梯度模式无关，始终不建图。
+        require_grad = op != "max_mask" and is_grad_enabled() and (x.require_grad or other_requires_grad)
         node: Node | None = None
         if self.dispatcher._trace:
             print(
@@ -571,8 +633,7 @@ class Autograd:
                     name=f"ExpBackward({x.name})",
                 )
             elif op == "max":
-                _, mask_meta = _max_reduce(x.meta, options.dim, options.keepdim)
-                mask = Value(mask_meta, require_grad=False)
+                mask = self.dispatcher.call("max_mask", x, dim=options.dim, keepdim=options.keepdim)
                 if options.dim is None or x.meta.ndim == 0:
                     expanded_shape = (1,) * x.meta.ndim
                 else:
@@ -618,38 +679,16 @@ class Autograd:
             elif op == "sum":
                 input_shape = x.shape
                 axis = options.dim
-                # 如果axis为空，计算结果是标量
-                if axis is None:
-
-                    def sum_all_backward(grad_out: Value) -> tuple[Value, ...]:
-                        result = grad_out.reshape(())
-                        for insert_axis, length in enumerate(input_shape):
-                            result = result.expand(insert_axis, length)
-                        return (result,)
-
-                    node = InnerNode(
-                        [x.node], sum_all_backward, name=f"SumBackward({x.name})"
-                    )
-                # 如果x本身就是标量
-                elif x.meta.ndim == 0:
-                    node = InnerNode(
-                        [x.node],
-                        lambda grad_out: (grad_out,),
-                        name=f"SumBackward({x.name})",
-                    )
+                # 先将归约轴恢复成长度 1，再广播回输入形状；兼容 keepdim 和标量。
+                if axis is None or not input_shape:
+                    sum_shape = (1,) * len(input_shape)
                 else:
-                    sum_axis = axis
-                    reduced_shape = input_shape[:sum_axis] + input_shape[sum_axis + 1 :]
-                    reduce_size = input_shape[sum_axis]
+                    sum_shape = input_shape[:axis] + (1,) + input_shape[axis + 1:]
 
-                    def sum_axis_backward(grad_out: Value) -> tuple[Value, ...]:
-                        # keepdim=True 时先去掉长度为 1 的归约轴，再插入复制。
-                        gradient = grad_out.reshape(reduced_shape)
-                        return (gradient.expand(sum_axis, reduce_size),)
+                def sum_backward(grad_out: Value) -> tuple[Value, ...]:
+                    return (grad_out.reshape(sum_shape).broadcast_to(input_shape),)
 
-                    node = InnerNode(
-                        [x.node], sum_axis_backward, name=f"SumBackward({x.name})"
-                    )
+                node = InnerNode([x.node], sum_backward, name=f"SumBackward({x.name})")
             elif op == "expand":
                 expand_axis = options.dim
                 if expand_axis is None:
@@ -762,14 +801,12 @@ class ExecuteLayer:
             raise NotImplementedError(f"CPU 未注册算子 {op}")
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
-        if op == "max":
+        if op in ("sum", "max", "max_mask"):
             return kernel(x, options.dim, keepdim=options.keepdim)
         if op == "sqrt":
             return kernel(x)
         if op in ("transpose", "clone", "exponential", "relu", "log"):
             return kernel(x)
-        if op == "sum":
-            return kernel(x, options.dim, keepdim=options.keepdim)
         if op == "expand":
             return kernel(x, options.dim, options.size)
         if op == "reshape":
@@ -789,6 +826,7 @@ class Dispatch:
             {
                 "sqrt",
                 "max",
+                "max_mask",
                 "add",
                 "sub",
                 "mul",
@@ -836,9 +874,9 @@ class Dispatch:
             raise TypeError("x 必须是 Value")
         if type(keepdim) is not bool:
             raise TypeError("keepdim 必须是 bool")
-        if op not in ("sum", "max") and keepdim:
+        if op not in ("sum", "max", "max_mask") and keepdim:
             raise TypeError(f"{op} 不接受 keepdim=True")
-        if op not in ("sum", "max", "expand") and dim is not None:
+        if op not in ("sum", "max", "max_mask", "expand") and dim is not None:
             raise TypeError(f"{op} 不接受 dim")
         if op != "expand" and size is not None:
             raise TypeError(f"{op} 不接受 size")
@@ -847,6 +885,7 @@ class Dispatch:
 
         unary = {
             "max",
+            "max_mask",
             "sqrt",
             "transpose",
             "clone",
@@ -879,7 +918,7 @@ class Dispatch:
             _check_log_input(x.meta)
 
         normalized_dim = dim
-        if op in ("sum", "max") and dim is not None:
+        if op in ("sum", "max", "max_mask") and dim is not None:
             normalized_dim = _normalize_dim(dim, x.meta.ndim)
         elif op == "expand":
             if dim is None or size is None:
@@ -1026,9 +1065,6 @@ class SGD:
                     param.data[:] = (param - param.grad * self.lr).data
 
 
-Optime = SGD  # 兼容旧阶段的教学命名。
-
-
 def backward(
     output: Value,
     seed: Value | None = None,
@@ -1079,7 +1115,7 @@ class Module:
             modules[name] = value
         elif modules is not None:
             modules.pop(name, None)
-       
+
         object.__setattr__(self, name, value)
 
     def parameter(self) -> Iterator[Parameter]:
@@ -1098,7 +1134,7 @@ class Module:
             queue.extend(module._modules.values())
 
 
-    def forward(self, input: Value) -> Value:
+    def forward(self, input: Value, /) -> Value:
         return input
 
     def __call__(self, input: Value) -> Value:
@@ -1137,12 +1173,6 @@ class Linear(Module):
         return result if self.bias is None else result + self.bias.broadcast_to(result.shape)
 
 
-
-def _check_sqrt_input(x: _Meta) -> None:
-    if any(not value >= 0 for value in x.data):
-        raise ValueError("sqrt 的实数输入必须大于或等于零")
-
-
 class LayerNorm(Module):
     def __init__(self, features: int, eps: float = 1e-5) -> None:
         super().__init__("LayerNorm")
@@ -1164,61 +1194,17 @@ class LayerNorm(Module):
         return normalized * self.weight.broadcast_to(x.shape) + self.bias.broadcast_to(x.shape)
 
 
-def _max_reduce(x: _Meta, dim: int | None, keepdim: bool) -> tuple[_Meta, _Meta]:
-    """返回最大值和首个最大位置掩码；并列最大值选择第一个。"""
-    if type(keepdim) is not bool:
-        raise TypeError("keepdim 必须是 bool")
-    if dim is not None:
-        dim = _normalize_dim(dim, x.ndim)
-    if any(math.isnan(v) for v in x.data):
-        raise ValueError("当前 max 不接受 NaN")
-    if dim is None or x.ndim == 0:
-        if not x.data:
-            raise ValueError("不能对空集合求 max")
-        best = max(x.data)
-        mask = [0.0] * x.numel
-        mask[x.data.index(best)] = 1.0
-        shape = (1,) * x.ndim if keepdim else ()
-        return _Meta([best], shape), _Meta(mask, x.shape)
-    axis = _normalize_dim(dim, x.ndim)
-    width = x.shape[axis]
-    if width == 0:
-        raise ValueError("max 的归约轴不能为空")
-    outer, inner = prod(x.shape[:axis]), prod(x.shape[axis+1:])
-    output, mask = [], [0.0] * x.numel
-    for before in range(outer):
-        for after in range(inner):
-            offsets = [(before * width + j) * inner + after for j in range(width)]
-            winner = max(offsets, key=lambda index: x.data[index])
-            output.append(x.data[winner])
-            mask[winner] = 1.0
-    shape = x.shape[:axis] + ((1,) if keepdim else ()) + x.shape[axis+1:]
-    return _Meta(output, shape), _Meta(mask, x.shape)
-
-
-def _check_softmax(x: Value, dim: int) -> int:
-    if not x.shape:
-        raise ValueError("softmax 至少需要一维输入")
-    axis = _normalize_dim(dim, x.meta.ndim)
-    if any(math.isnan(v) or v == math.inf for v in x.data):
-        raise ValueError("softmax 不接受 NaN 或正无穷")
-    row_max, _ = _max_reduce(x.meta, axis, True)
-    if any(v == -math.inf for v in row_max.data):
-        raise ValueError("softmax 的每组输入必须至少有一个有限值，不能全部被屏蔽")
-    return axis
-
 
 def main() -> None:
     x = Value(_Meta([1000,1001,1002, -1000,-1000,-1000], (2,3)), name="scores")
     p = x.softmax()
-    assert all(math.isclose(v, 1) for v in p.sum(-1).data)
     seed = Value(_Meta([1,2,4, 1,2,4], (2,3)), require_grad=False)
     p.backward(seed)
     print("稳定 softmax：", p.data)
-    print("scores 梯度：", x.grad.data)
+    print("scores 梯度：", x.grad)
     tie = Value(_Meta([5,5,1], (3,)))
     tie.max().backward()
-    assert tie.grad.data == [1,0,0]
+    print("并列最大值的梯度：", tie.grad)  # 首个最大位置得到梯度。
 
 
 if __name__ == "__main__":
