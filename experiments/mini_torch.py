@@ -110,7 +110,7 @@ class _Meta:
 class OpOptions:
     """在处理层之间传递不可变的算子配置；配置不参与梯度计算。"""
 
-    dim: int | None = None
+    dim: int | None = None  # 已规范化的非负下标；None 表示归约所有维度。
     size: int | None = None
     keepdim: bool = False
     shape: tuple[int, ...] | None = None
@@ -125,7 +125,7 @@ class Backend:
 
 
 class CPUBackend(Backend):
-    """CPU 数值实现：只处理 _Meta，不创建反向节点。"""
+    """CPU 数值实现：只处理 _Meta，维度已由 Dispatcher 规范化。"""
 
     def __init__(self, name: str):
         super().__init__(name)
@@ -189,8 +189,6 @@ class CPUBackend(Backend):
 
     def sum(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
         """沿单个维度求和；dim=None 求全部元素之和，空集合的和为 0。"""
-        if dim is not None:
-            dim = _normalize_dim(dim, x.ndim)
         if dim is None:
             shape = (1,) * x.ndim if keepdim else ()
             return _Meta([sum(x.data)], shape)
@@ -219,7 +217,6 @@ class CPUBackend(Backend):
         等价于 torch.unsqueeze(x, dim) 后将新维 expand 到 size，再物化副本。
         例如 (2,) 在 dim=1,size=3 时变成 (2,3)，并非 PyTorch 的 expand 接口。
         """
-        dim = _normalize_dim(dim, x.ndim, insert=True)
         outer = prod(x.shape[:dim])
         inner = prod(x.shape[dim:])
         result: list[float] = []
@@ -249,13 +246,11 @@ class CPUBackend(Backend):
         return self._max_with_mask(x, dim, keepdim)[0]
 
     def max_mask(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
-        """返回输入形状的首个最大位置掩码；选择结果本身不可微。"""
+        """返回输入形状的首个最大位置掩码"""
         return self._max_with_mask(x, dim, keepdim)[1]
 
     def _max_with_mask(self, x: _Meta, dim: int | None, keepdim: bool) -> tuple[_Meta, _Meta]:
         """返回最大值和首个最大位置掩码；并列最大值选择第一个。"""
-        if dim is not None:
-            dim = _normalize_dim(dim, x.ndim)
         if dim is None or x.ndim == 0:
             best = max(x.data)
             mask = [0.0] * x.numel
@@ -404,18 +399,23 @@ class Value:
     def transpose(self) -> Value:
         return _dispatch.call("transpose", self)
 
+     # 可以直接使用.T进行矩阵转置运算
+    @property
+    def T(self) -> Value:
+        return self.transpose()
+
     def sum(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
         return _dispatch.call("sum", self, dim=dim, keepdim=keepdim)
 
     def expand(self, dim: int, size: int) -> Value:
-        """在 dim 插入并复制新维度，详见 CPUBackend.expand。"""
+        """在 dim 插入并复制新维度。"""
         return _dispatch.call("expand", self, dim=dim, size=size)
 
     def reshape(self, shape: Sequence[int]) -> Value:
         return _dispatch.call("reshape", self, shape=shape)
 
     def broadcast_to(self, shape: Sequence[int]) -> Value:
-        """从右对齐各维，长度为 1 的维度可以扩展；组合 reshape 和 expand。"""
+        """从右对齐各维，长度为 1 的维度可以扩展。"""
         target = tuple(shape)
         if len(target) < len(self.shape):
             raise ValueError("广播后的维数不能少于输入")
@@ -442,28 +442,13 @@ class Value:
     def relu(self) -> Value:
         return _dispatch.call("relu", self)
 
-    # 可以直接使用.T进行矩阵转置运算
-    @property
-    def T(self) -> Value:
-        return self.transpose()
-
-    # create_graph 表示是否在反向计算过程中再次构造反向计算图
-    def backward(
-        self,
-        seed: Value | None = None,
-        *,
-        create_graph: bool = False,
-        _trace: bool = False,
-    ) -> None:
-        backward(self, seed, create_graph=create_graph, _trace=_trace)
-
     def __repr__(self) -> str:
         return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
 
     def mean(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
-        axis = None if dim is None else _normalize_dim(dim, self.meta.ndim)
-        count = self.meta.numel if axis is None else (self.shape[axis] if self.shape else 1)
-        return self.sum(dim, keepdim=keepdim) * (1.0 / count)
+        result = self.sum(dim, keepdim=keepdim)
+        count = self.meta.numel if dim is None else (self.shape[dim] if self.shape else 1)
+        return result * (1.0 / count)
 
     def sqrt(self) -> Value:
         return _dispatch.call("sqrt", self)
@@ -472,18 +457,26 @@ class Value:
         return _dispatch.call("max", self, dim=dim, keepdim=keepdim)
 
     def softmax(self, dim: int = -1) -> Value:
-        axis = _normalize_dim(dim, self.meta.ndim)
-        maximum = self.max(axis, keepdim=True)
+        maximum = self.max(dim, keepdim=True)
         shifted = self - maximum.broadcast_to(self.shape)
         numerator = shifted.exp()
-        return numerator / numerator.sum(axis, keepdim=True).broadcast_to(self.shape)
+        return numerator / numerator.sum(dim, keepdim=True).broadcast_to(self.shape)
 
     def log_softmax(self, dim: int = -1) -> Value:
-        axis = _normalize_dim(dim, self.meta.ndim)
-        maximum = self.max(axis, keepdim=True)
+        maximum = self.max(dim, keepdim=True)
         shifted = self - maximum.broadcast_to(self.shape)
-        normalizer = shifted.exp().sum(axis, keepdim=True).log()
+        normalizer = shifted.exp().sum(dim, keepdim=True).log()
         return shifted - normalizer.broadcast_to(self.shape)
+
+     # create_graph 表示是否在反向计算过程中再次构造反向计算图
+    def backward(
+        self,
+        seed: Value | None = None,
+        *,
+        create_graph: bool = False,
+        _trace: bool = False,
+    ) -> None:
+        backward(self, seed, create_graph=create_graph, _trace=_trace)
 
 
 class Autograd:
@@ -533,7 +526,10 @@ class Autograd:
                     name=f"ExpBackward({x.name})",
                 )
             elif op == "max":
-                mask = self.dispatcher.call("max_mask", x, dim=options.dim, keepdim=options.keepdim)
+                # 复用已整理的配置，内部派发不再规范化维度。
+                mask = self.dispatcher.redispatch(
+                    "max_mask", x, options=options, exclude=excluded | {"Autograd"}
+                )
                 if options.dim is None or x.meta.ndim == 0:
                     expanded_shape = (1,) * x.meta.ndim
                 else:
