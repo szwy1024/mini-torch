@@ -21,10 +21,16 @@ from typing import Iterator
 
 def _normalize_dim(dim: int, ndim: int, *, insert: bool = False) -> int:
     """普通维度范围 [-ndim, ndim-1]；插入位置范围 [-ndim-1, ndim]。"""
-    limit = ndim + 1 if insert else max(ndim, 1)
+    if insert:
+        limit = ndim + 1
+    else:
+        limit = max(ndim, 1)
     if not -limit <= dim < limit:
         raise ValueError(f"dim={dim} 超出范围；输入维数={ndim}，insert={insert}")
-    return dim + limit if dim < 0 else dim
+    if dim < 0:
+        return dim + limit
+    else:
+        return dim
 
 
 def _check_same_shape(x: _Meta, y: _Meta) -> None:
@@ -190,7 +196,10 @@ class CPUBackend(Backend):
     def sum(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
         """沿单个维度求和；dim=None 求全部元素之和，空集合的和为 0。"""
         if dim is None:
-            shape = (1,) * x.ndim if keepdim else ()
+            if keepdim:
+                shape = (1,) * x.ndim
+            else:
+                shape = ()
             return _Meta([sum(x.data)], shape)
 
         # 标量允许 dim=0/-1；归约后仍为标量。
@@ -207,7 +216,10 @@ class CPUBackend(Backend):
                     offset = (outer_index * reduce_size + reduce_index) * inner + inner_index
                     total += x.data[offset]
                 result.append(total)
-        middle = (1,) if keepdim else ()
+        if keepdim:
+            middle = (1,)
+        else:
+            middle = ()
         shape = x.shape[:dim] + middle + x.shape[dim + 1 :]
         return _Meta(result, shape)
 
@@ -255,7 +267,10 @@ class CPUBackend(Backend):
             best = max(x.data)
             mask = [0.0] * x.numel
             mask[x.data.index(best)] = 1.0
-            shape = (1,) * x.ndim if keepdim else ()
+            if keepdim:
+                shape = (1,) * x.ndim
+            else:
+                shape = ()
             return _Meta([best], shape), _Meta(mask, x.shape)
         axis = dim
         width = x.shape[axis]
@@ -267,7 +282,11 @@ class CPUBackend(Backend):
                 winner = max(offsets, key=lambda index: x.data[index])
                 output.append(x.data[winner])
                 mask[winner] = 1.0
-        shape = x.shape[:axis] + ((1,) if keepdim else ()) + x.shape[axis+1:]
+        if keepdim:
+            middle = (1,)
+        else:
+            middle = ()
+        shape = x.shape[:axis] + middle + x.shape[axis+1:]
         return _Meta(output, shape), _Meta(mask, x.shape)
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
@@ -324,7 +343,10 @@ class LeafNode(Node):
 
     def apply(self, grad_out: Value) -> tuple[Value, ...]:
         previous = self.value.grad
-        self.value.grad = grad_out.clone() if previous is None else previous + grad_out
+        if previous is None:
+            self.value.grad = grad_out.clone()
+        else:
+            self.value.grad = previous + grad_out
         return ()
 
 
@@ -338,7 +360,10 @@ class InnerNode(Node):
     ) -> None:
         super().__init__(edge=edge, name=name)
         self.backrule = backrule
-        self.data = {} if data is None else data
+        if data is None:
+            self.data = {}
+        else:
+            self.data = data
 
     def apply(self, grad_out: Value) -> tuple[Value, ...]:
         return self.backrule(grad_out)
@@ -399,7 +424,7 @@ class Value:
     def transpose(self) -> Value:
         return _dispatch.call("transpose", self)
 
-     # 可以直接使用.T进行矩阵转置运算
+    # 可以直接使用.T进行矩阵转置运算
     @property
     def T(self) -> Value:
         return self.transpose()
@@ -413,6 +438,24 @@ class Value:
 
     def reshape(self, shape: Sequence[int]) -> Value:
         return _dispatch.call("reshape", self, shape=shape)
+
+    def exp(self) -> Value:
+        return self.exponential()
+
+    def log(self) -> Value:
+        return _dispatch.call("log", self)
+
+    def exponential(self) -> Value:
+        return _dispatch.call("exponential", self)
+
+    def relu(self) -> Value:
+        return _dispatch.call("relu", self)
+
+    def sqrt(self) -> Value:
+        return _dispatch.call("sqrt", self)
+
+    def max(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
+        return _dispatch.call("max", self, dim=dim, keepdim=keepdim)
 
     def broadcast_to(self, shape: Sequence[int]) -> Value:
         """从右对齐各维，长度为 1 的维度可以扩展。"""
@@ -430,31 +473,17 @@ class Value:
             result = result.reshape(reduced).expand(axis, size)
         return result
 
-    def exp(self) -> Value:
-        return self.exponential()
-
-    def log(self) -> Value:
-        return _dispatch.call("log", self)
-
-    def exponential(self) -> Value:
-        return _dispatch.call("exponential", self)
-
-    def relu(self) -> Value:
-        return _dispatch.call("relu", self)
-
-    def __repr__(self) -> str:
-        return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
-
     def mean(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
         result = self.sum(dim, keepdim=keepdim)
-        count = self.meta.numel if dim is None else (self.shape[dim] if self.shape else 1)
+        if dim is None:
+            count = self.meta.numel
+        else:
+            if self.shape:
+                count = self.shape[dim]
+            else:
+                # shape=() 表示标量，只有一个元素
+                count = 1
         return result * (1.0 / count)
-
-    def sqrt(self) -> Value:
-        return _dispatch.call("sqrt", self)
-
-    def max(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
-        return _dispatch.call("max", self, dim=dim, keepdim=keepdim)
 
     def softmax(self, dim: int = -1) -> Value:
         maximum = self.max(dim, keepdim=True)
@@ -468,7 +497,10 @@ class Value:
         normalizer = shifted.exp().sum(dim, keepdim=True).log()
         return shifted - normalizer.broadcast_to(self.shape)
 
-     # create_graph 表示是否在反向计算过程中再次构造反向计算图
+    def __repr__(self) -> str:
+        return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
+
+    # create_graph 表示是否在反向计算过程中再次构造反向计算图
     def backward(
         self,
         seed: Value | None = None,
@@ -495,7 +527,10 @@ class Autograd:
         excluded: frozenset[str],
     ) -> Value:
         # 只有value类型可能需要梯度，纯数值不关联梯度信息
-        other_requires_grad = y.require_grad if isinstance(y, Value) else False
+        if isinstance(y, Value):
+            other_requires_grad = y.require_grad
+        else:
+            other_requires_grad = False
         require_grad = is_grad_enabled() and (x.require_grad or other_requires_grad)
         if op == "max_mask":  # 离散选择不建图。
             require_grad = False
@@ -552,8 +587,14 @@ class Autograd:
                     name=f"LogBackward({x.name})",
                 )
             elif op == "relu":
+                mask_data = []
+                for value in x.data:
+                    if value > 0:
+                        mask_data.append(1.0)
+                    else:
+                        mask_data.append(0.0)
                 mask = Value(
-                    _Meta([1.0 if value > 0 else 0.0 for value in x.data], x.shape),
+                    _Meta(mask_data, x.shape),
                     name=f"ReluMask({x.name})",
                     require_grad=False,
                 )
@@ -678,7 +719,10 @@ class ExecuteLayer:
 
     def apply(self, op: str, x: Value, y: Value | float | None,
               options: OpOptions, excluded: frozenset[str]) -> Value:
-        argument = y.meta if isinstance(y, Value) else y
+        if isinstance(y, Value):
+            argument = y.meta
+        else:
+            argument = y
         result = self.call_kernel(op, x.meta, argument, options=options)
         return Value(result, name=op, require_grad=False)
 
@@ -737,7 +781,10 @@ class Dispatch:
             y = float(y)
         if dim is not None:
             dim = _normalize_dim(dim, x.meta.ndim, insert=op == "expand")
-        target = tuple(shape) if shape is not None else None
+        if shape is not None:
+            target = tuple(shape)
+        else:
+            target = None
         options = OpOptions(dim, size, keepdim, target)
         return self.redispatch(op, x, y, options=options, exclude=frozenset())
 
@@ -829,9 +876,10 @@ class AutogradEngine:
             if edge is None:
                 continue
             previous = grad_buffers.get(edge)
-            grad_buffers[edge] = (
-                contribution if previous is None else previous + contribution
-            )
+            if previous is None:
+                grad_buffers[edge] = contribution
+            else:
+                grad_buffers[edge] = previous + contribution
             pending[edge] -= 1
             if _trace:
                 print(
@@ -941,16 +989,25 @@ class Linear(Module):
                  rng: random.Random | None = None) -> None:
         super().__init__("Linear")
         self.in_features, self.out_features = in_features, out_features
-        generator = rng if rng is not None else random
+        if rng is not None:
+            generator = rng
+        else:
+            generator = random
         bound = math.sqrt(6.0 / (in_features + out_features))
         self.weight = Parameter(_Meta(
             [generator.uniform(-bound, bound) for _ in range(in_features * out_features)],
             (in_features, out_features)), name="weight")
-        self.bias = Parameter(_Meta([0] * out_features, (out_features,)), name="bias") if bias else None
+        if bias:
+            self.bias = Parameter(_Meta([0] * out_features, (out_features,)), name="bias")
+        else:
+            self.bias = None
 
     def forward(self, x: Value) -> Value:
         result = x @ self.weight
-        return result if self.bias is None else result + self.bias.broadcast_to(result.shape)
+        if self.bias is None:
+            return result
+        else:
+            return result + self.bias.broadcast_to(result.shape)
 
 
 class LayerNorm(Module):
