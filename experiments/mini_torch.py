@@ -213,7 +213,9 @@ class CPUBackend(Backend):
             for inner_index in range(inner):
                 total = 0.0
                 for reduce_index in range(reduce_size):
-                    offset = (outer_index * reduce_size + reduce_index) * inner + inner_index
+                    offset = (
+                        outer_index * reduce_size + reduce_index
+                    ) * inner + inner_index
                     total += x.data[offset]
                 result.append(total)
         if keepdim:
@@ -257,11 +259,15 @@ class CPUBackend(Backend):
     def max(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
         return self._max_with_mask(x, dim, keepdim)[0]
 
-    def max_mask(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
+    def max_mask(
+        self, x: _Meta, dim: int | None = None, *, keepdim: bool = False
+    ) -> _Meta:
         """返回输入形状的首个最大位置掩码"""
         return self._max_with_mask(x, dim, keepdim)[1]
 
-    def _max_with_mask(self, x: _Meta, dim: int | None, keepdim: bool) -> tuple[_Meta, _Meta]:
+    def _max_with_mask(
+        self, x: _Meta, dim: int | None, keepdim: bool
+    ) -> tuple[_Meta, _Meta]:
         """返回最大值和首个最大位置掩码；并列最大值选择第一个。"""
         if dim is None or x.ndim == 0:
             best = max(x.data)
@@ -274,7 +280,7 @@ class CPUBackend(Backend):
             return _Meta([best], shape), _Meta(mask, x.shape)
         axis = dim
         width = x.shape[axis]
-        outer, inner = prod(x.shape[:axis]), prod(x.shape[axis+1:])
+        outer, inner = prod(x.shape[:axis]), prod(x.shape[axis + 1 :])
         output, mask = [], [0.0] * x.numel
         for before in range(outer):
             for after in range(inner):
@@ -286,7 +292,7 @@ class CPUBackend(Backend):
             middle = (1,)
         else:
             middle = ()
-        shape = x.shape[:axis] + middle + x.shape[axis+1:]
+        shape = x.shape[:axis] + middle + x.shape[axis + 1 :]
         return _Meta(output, shape), _Meta(mask, x.shape)
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
@@ -469,7 +475,7 @@ class Value:
                 continue
             if source != 1:
                 raise ValueError(f"不能将 {self.shape} 广播到 {target}")
-            reduced = result.shape[:axis] + result.shape[axis + 1:]
+            reduced = result.shape[:axis] + result.shape[axis + 1 :]
             result = result.reshape(reduced).expand(axis, size)
         return result
 
@@ -561,7 +567,6 @@ class Autograd:
                     name=f"ExpBackward({x.name})",
                 )
             elif op == "max":
-                # 复用已整理的配置，内部派发不再规范化维度。
                 mask = self.dispatcher.redispatch(
                     "max_mask", x, options=options, exclude=excluded | {"Autograd"}
                 )
@@ -569,15 +574,22 @@ class Autograd:
                     expanded_shape = (1,) * x.meta.ndim
                 else:
                     axis = options.dim
-                    expanded_shape = x.shape[:axis] + (1,) + x.shape[axis+1:]
+                    expanded_shape = x.shape[:axis] + (1,) + x.shape[axis + 1 :]
+
                 def max_backward(g: Value) -> tuple[Value, ...]:
                     return (g.reshape(expanded_shape).broadcast_to(x.shape) * mask,)
-                node = InnerNode([x.node], max_backward, data={"mask": mask}, name="MaxBackward")
+
+                node = InnerNode(
+                    [x.node], max_backward, data={"mask": mask}, name="MaxBackward"
+                )
             elif op == "sqrt":
                 saved = {"input": x.clone()}
-                node = InnerNode([x.node],
+                node = InnerNode(
+                    [x.node],
                     lambda g: (g / (saved["input"].sqrt() * 2.0),),
-                    data=saved, name=f"SqrtBackward({x.name})")
+                    data=saved,
+                    name=f"SqrtBackward({x.name})",
+                )
             elif op == "log":
                 saved = {"input": x.clone()}
                 node = InnerNode(
@@ -618,7 +630,7 @@ class Autograd:
                 if axis is None or not input_shape:
                     sum_shape = (1,) * len(input_shape)
                 else:
-                    sum_shape = input_shape[:axis] + (1,) + input_shape[axis + 1:]
+                    sum_shape = input_shape[:axis] + (1,) + input_shape[axis + 1 :]
 
                 def sum_backward(grad_out: Value) -> tuple[Value, ...]:
                     return (grad_out.reshape(sum_shape).broadcast_to(input_shape),)
@@ -661,8 +673,6 @@ class Autograd:
                         left = saved["left"]
                         right = saved["right"]
                         grad_left = grad_out / right
-                        # 等价于 -grad_out * left / right²。
-                        # 分两次除以 right，避免先平方让很小的分母下溢为零。
                         grad_right = (grad_out * -1.0) * (left / right) / right
                         return (grad_left, grad_right)
 
@@ -674,7 +684,8 @@ class Autograd:
                     )
                 elif op in ("mul", "matmul"):
                     # 保留前向快照，同时保留它到原输入的求导关系。
-                    # x.meta.clone() 只有数值；x.clone() 则通过 CloneBackward 连接 x。
+                    # x.meta.clone() 只有数值
+                    # x.clone() 通过 CloneBackward 连接 x。
                     saved = {"left": x.clone(), "right": y.clone()}
                     if op == "mul":
 
@@ -717,8 +728,14 @@ class ExecuteLayer:
             "gpu": gpu.get_ability(),
         }
 
-    def apply(self, op: str, x: Value, y: Value | float | None,
-              options: OpOptions, excluded: frozenset[str]) -> Value:
+    def apply(
+        self,
+        op: str,
+        x: Value,
+        y: Value | float | None,
+        options: OpOptions,
+        excluded: frozenset[str],
+    ) -> Value:
         if isinstance(y, Value):
             argument = y.meta
         else:
@@ -895,6 +912,7 @@ _engine = AutogradEngine()
 
 class SGD:
     """只更新不同的叶子参数；保持 Parameter 对象和存储身份不变。"""
+
     def __init__(self, params: Iterator[Parameter], lr: float = 0.01) -> None:
         self.params = list(dict.fromkeys(params))
         self.lr = lr
@@ -936,11 +954,11 @@ class Parameter(Value):
 
 class Module:
     _parameters: dict[str, Parameter]
-    _modules: dict[str,Module]
+    _modules: dict[str, Module]
 
     def __init__(self, name: str) -> None:
         object.__setattr__(self, "_parameters", {})
-        object.__setattr__(self,"_modules",{})
+        object.__setattr__(self, "_modules", {})
         self.name = name
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -967,7 +985,6 @@ class Module:
                     yield param
             queue.extend(module._modules.values())
 
-
     def forward(self, input: Value, /) -> Value:
         return input
 
@@ -984,9 +1001,16 @@ class Module:
 
 
 class Linear(Module):
-    """任意正整数输入/输出维度；末维做投影，显式广播偏置。"""
-    def __init__(self, in_features: int, out_features: int, *, bias: bool = True,
-                 rng: random.Random | None = None) -> None:
+    """任意正整数输入/输出维度。"""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = True,
+        rng: random.Random | None = None,
+    ) -> None:
         super().__init__("Linear")
         self.in_features, self.out_features = in_features, out_features
         if rng is not None:
@@ -994,11 +1018,20 @@ class Linear(Module):
         else:
             generator = random
         bound = math.sqrt(6.0 / (in_features + out_features))
-        self.weight = Parameter(_Meta(
-            [generator.uniform(-bound, bound) for _ in range(in_features * out_features)],
-            (in_features, out_features)), name="weight")
+        self.weight = Parameter(
+            _Meta(
+                [
+                    generator.uniform(-bound, bound)
+                    for _ in range(in_features * out_features)
+                ],
+                (in_features, out_features),
+            ),
+            name="weight",
+        )
         if bias:
-            self.bias = Parameter(_Meta([0] * out_features, (out_features,)), name="bias")
+            self.bias = Parameter(
+                _Meta([0] * out_features, (out_features,)), name="bias"
+            )
         else:
             self.bias = None
 
@@ -1022,19 +1055,45 @@ class LayerNorm(Module):
             raise ValueError("LayerNorm 的输入末维不匹配")
         centered = x - x.mean(-1, keepdim=True).broadcast_to(x.shape)
         variance = (centered * centered).mean(-1, keepdim=True)
-        epsilon = Value(_Meta([self.eps] * variance.meta.numel, variance.shape), require_grad=False)
+        epsilon = Value(
+            _Meta([self.eps] * variance.meta.numel, variance.shape), require_grad=False
+        )
         normalized = centered / (variance + epsilon).sqrt().broadcast_to(x.shape)
-        return normalized * self.weight.broadcast_to(x.shape) + self.bias.broadcast_to(x.shape)
+        return normalized * self.weight.broadcast_to(x.shape) + self.bias.broadcast_to(
+            x.shape
+        )
 
 
-def main() -> None:
-    x = Value(_Meta([1000,1001,1002, -1000,-1000,-1000], (2,3)), name="scores")
+class Attention(Module):
+    """单头自注意力，输入和输出形状均为 (seq_len, embed_dim)。"""
+
+    def __init__(self, embed_dim: int, *, bias: bool = False) -> None:
+        super().__init__("Attention")
+        self.embed_dim = embed_dim
+        self.q_proj = Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = Linear(embed_dim, embed_dim, bias=bias)
+
+    def forward(self, x: Value) -> Value:
+        if x.shape[-1] != self.embed_dim:
+            raise ValueError("Attention 的输入末维不匹配")
+        query = self.q_proj(x)
+        key = self.k_proj(x)
+        value = self.v_proj(x)
+        scale = 1.0 / math.sqrt(self.embed_dim)
+        scores = (query @ key.T) * scale
+        attention_weights = scores.softmax(dim=-1)
+        return attention_weights @ value
+
+
+def main() -> None: 
+    x = Value(_Meta([1000, 1001, 1002, -1000, -1000, -1000], (2, 3)), name="scores")
     p = x.softmax()
-    seed = Value(_Meta([1,2,4, 1,2,4], (2,3)), require_grad=False)
+    seed = Value(_Meta([1, 2, 4, 1, 2, 4], (2, 3)), require_grad=False)
     p.backward(seed)
     print("稳定 softmax：", p.data)
     print("scores 梯度：", x.grad)
-    tie = Value(_Meta([5,5,1], (3,)))
+    tie = Value(_Meta([5, 5, 1], (3,)))
     tie.max().backward()
     print("并列最大值的梯度：", tie.grad)  # 首个最大位置得到梯度。
 
