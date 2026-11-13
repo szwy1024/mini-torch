@@ -1,8 +1,8 @@
-"""学习阶段 18：max 掩码与稳定 softmax / log_softmax。
+"""纯 Python 教学框架：张量、自动微分与单头 TransformerBlock。
 
 运行：python experiments/mini_torch.py
-max 并列时选首个位置；softmax 先减去最大值。组合运算保留高阶求导。
-纯 Python CPU 教学实现；基础算子经 Dispatcher，组合模块复用 Value 的求导。
+main 演示 FFN 的前向与反向，以及 TransformerBlock 的简单回归训练。
+基础算子经 Dispatcher 在 CPU 执行，组合模块复用 Value 的自动微分。
 """
 
 from __future__ import annotations
@@ -1086,16 +1086,97 @@ class Attention(Module):
         return attention_weights @ value
 
 
-def main() -> None: 
-    x = Value(_Meta([1000, 1001, 1002, -1000, -1000, -1000], (2, 3)), name="scores")
-    p = x.softmax()
-    seed = Value(_Meta([1, 2, 4, 1, 2, 4], (2, 3)), require_grad=False)
-    p.backward(seed)
-    print("稳定 softmax：", p.data)
-    print("scores 梯度：", x.grad)
-    tie = Value(_Meta([5, 5, 1], (3,)))
-    tie.max().backward()
-    print("并列最大值的梯度：", tie.grad)  # 首个最大位置得到梯度。
+class FFN(Module):
+    """逐 token 的前馈网络：input_dim → hidden_dim → output_dim。"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        *,
+        bias: bool = False,
+    ) -> None:
+        super().__init__("FFN")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.linear1 = Linear(input_dim, hidden_dim, bias=bias)
+        self.linear2 = Linear(hidden_dim, output_dim, bias=bias)
+
+    def forward(self, x: Value) -> Value:
+        if x.shape[-1] != self.input_dim:
+            raise ValueError("FFN 的输入末维不匹配")
+        return self.linear2(self.linear1(x).relu())
+
+
+class TransformerBlock(Module):
+    """单头 Pre-Norm Transformer 层，输入和输出均为 (seq_len, embed_dim)。"""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        *,
+        eps: float = 1e-5,
+        bias: bool = False,
+    ) -> None:
+        super().__init__("TransformerBlock")
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.norm1 = LayerNorm(embed_dim, eps=eps)
+        self.norm2 = LayerNorm(embed_dim, eps=eps)
+        self.attention = Attention(embed_dim, bias=bias)
+        self.ffn = FFN(embed_dim, hidden_dim, embed_dim, bias=bias)
+
+    def forward(self, x: Value) -> Value:
+        if x.shape[-1] != self.embed_dim:
+            raise ValueError("TransformerBlock 的输入末维不匹配")
+        x = x + self.attention(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+def main() -> None:
+    random.seed(42)
+    x = Value(
+        _Meta([0.2, -0.4, 0.6, 0.8, -0.3, 0.5, 0.7, -0.2, 0.9, 0.1, -0.5, 0.4], (3, 4)),
+        name="input",
+        require_grad=False,
+    )
+
+    # 独立 FFN 可以改变特征维度；三个 token 使用同一组参数。
+    ffn = FFN(input_dim=4, hidden_dim=8, output_dim=2, bias=True)
+    output = ffn(x)
+    output.sum().backward()
+    assert output.shape == (3, 2)
+    assert all(param.grad is not None for param in ffn.parameters())
+    print("FFN 输入 / 输出形状：", x.shape, output.shape)
+
+    # TransformerBlock 保持特征维度不变，以零张量为目标验证训练过程。
+    block = TransformerBlock(embed_dim=4, hidden_dim=8, bias=True)
+    optimizer = SGD(block.parameters(), lr=0.02)
+    target = Value(_Meta([0.0] * 12, (3, 4)), require_grad=False)
+    with no_grad():
+        error = block(x) - target
+        initial_loss = (error * error).mean().data[0]
+
+    for _ in range(30):
+        optimizer.zero_grad()
+        output = block(x)
+        error = output - target
+        loss = (error * error).mean()
+        loss.backward()
+        optimizer.step()
+
+    with no_grad():
+        error = block(x) - target
+        final_loss = (error * error).mean().data[0]
+    assert output.shape == x.shape
+    assert all(param.grad is not None for param in block.parameters())
+    assert final_loss < initial_loss
+    print("TransformerBlock 输入 / 输出形状：", x.shape, output.shape)
+    print(f"训练 30 步：loss {initial_loss:.6f} → {final_loss:.6f}")
 
 
 if __name__ == "__main__":
