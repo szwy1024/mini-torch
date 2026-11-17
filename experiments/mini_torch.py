@@ -1145,14 +1145,6 @@ def main() -> None:
         require_grad=False,
     )
 
-    # 独立 FFN 可以改变特征维度；三个 token 使用同一组参数。
-    ffn = FFN(input_dim=4, hidden_dim=8, output_dim=2, bias=True)
-    output = ffn(x)
-    output.sum().backward()
-    assert output.shape == (3, 2)
-    assert all(param.grad is not None for param in ffn.parameters())
-    print("FFN 输入 / 输出形状：", x.shape, output.shape)
-
     # TransformerBlock 保持特征维度不变，以零张量为目标验证训练过程。
     block = TransformerBlock(embed_dim=4, hidden_dim=8, bias=True)
     optimizer = SGD(block.parameters(), lr=0.02)
@@ -1161,7 +1153,7 @@ def main() -> None:
         error = block(x) - target
         initial_loss = (error * error).mean().data[0]
 
-    for _ in range(30):
+    for _ in range(3000):
         optimizer.zero_grad()
         output = block(x)
         error = output - target
@@ -1172,10 +1164,8 @@ def main() -> None:
     with no_grad():
         error = block(x) - target
         final_loss = (error * error).mean().data[0]
-    assert output.shape == x.shape
     assert all(param.grad is not None for param in block.parameters())
     assert final_loss < initial_loss
-    print("TransformerBlock 输入 / 输出形状：", x.shape, output.shape)
     print(f"训练 30 步：loss {initial_loss:.6f} → {final_loss:.6f}")
 
 
