@@ -1422,7 +1422,12 @@ class Transformer(Module):
         self.lm_head = LM_Head(embed_dim, vocab_size, bias=lm_bias, rng=rng)
 
     def forward(self, x: Value) -> Value:
-        embedding = self.embedding(x) + self.position_encode(x)
+        seq_len = x.shape[0]
+        position_ids = Value(
+            _Meta(list(range(seq_len)), (seq_len,)),
+            require_grad=False,
+        )
+        embedding = self.embedding(x) + self.position_encode(position_ids)
         hidden1 = self.transformer_block1(embedding)
         hidden2 = self.transformer_block2(hidden1)
         hidden3 = self.transformer_block3(hidden2)
