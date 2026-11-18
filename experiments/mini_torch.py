@@ -1382,6 +1382,7 @@ class Transformer(Module):
         fnn_bias1: bool = False,
         fnn_bias2: bool = False,
         lm_bias: bool = False,
+        max_sequence_len: int = 100,
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("Transformer")
@@ -1389,6 +1390,7 @@ class Transformer(Module):
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.embedding = Embedding(vocab_size, embed_dim, rng=rng)
+        self.position_encode = Embedding(max_sequence_len, embed_dim, rng=rng)
         self.transformer_block1 = TransformerBlock(
             embed_dim,
             hidden_dim,
@@ -1420,13 +1422,13 @@ class Transformer(Module):
         self.lm_head = LM_Head(embed_dim, vocab_size, bias=lm_bias, rng=rng)
 
     def forward(self, x: Value) -> Value:
-        return self.lm_head(
-            self.layernorm(
-                self.transformer_block3(
-                    self.transformer_block2(self.transformer_block1(self.embedding(x)))
-                )
-            )
-        )
+        embedding = self.embedding(x) + self.position_encode(x)
+        hidden1 = self.transformer_block1(embedding)
+        hidden2 = self.transformer_block2(hidden1)
+        hidden3 = self.transformer_block3(hidden2)
+        final_norm = self.layernorm(hidden3)
+        output = self.lm_head(final_norm)
+        return output
 
 
 def main() -> None:
@@ -1437,7 +1439,15 @@ def main() -> None:
     seq_len = len(input_ids)
     x = Value(_Meta(input_ids, (seq_len,)), name="input", require_grad=False)
 
-    transformer = Transformer(vocab_size, embed_dim=16, hidden_dim=32,attention_bias=True,fnn_bias1=True,fnn_bias2=True,lm_bias=True)
+    transformer = Transformer(
+        vocab_size,
+        embed_dim=16,
+        hidden_dim=32,
+        attention_bias=True,
+        fnn_bias1=True,
+        fnn_bias2=True,
+        lm_bias=True,
+    )
     optimizer = SGD(transformer.parameters(), lr=0.05)
 
     for step in range(300):
