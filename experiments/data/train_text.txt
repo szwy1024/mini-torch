@@ -1,0 +1,107 @@
+the cat sits on the mat.
+the cat sleeps by the window.
+the cat drinks water from a bowl.
+the cat watches a small bird.
+the cat walks into the garden.
+the cat plays with a red ball.
+the cat rests under the table.
+the cat comes home at night.
+
+the dog runs in the park.
+the dog plays with a blue ball.
+the dog waits by the door.
+the dog drinks water after a walk.
+the dog sleeps beside the chair.
+the dog follows the boy home.
+the boy gives the dog some food.
+the dog and the cat rest in the sun.
+
+a bird sits in the tree.
+the bird sings in the morning.
+the bird flies over the garden.
+a small tree grows beside the house.
+the tree has green leaves.
+the garden has red and yellow flowers.
+the girl gives water to the flowers.
+the birds come back every morning.
+
+the sun rises in the morning.
+the sky is blue and clear.
+the air is warm in the afternoon.
+a small cloud moves across the sky.
+the wind moves the leaves.
+the rain falls on the roof.
+the ground is wet after the rain.
+the moon shines at night.
+
+the family lives in a small house.
+the house has a red door.
+the kitchen has a table and four chairs.
+the mother puts bread on the table.
+the father makes tea in the kitchen.
+the children eat breakfast together.
+after breakfast they walk to school.
+in the evening the family comes home.
+
+the girl opens her book.
+the boy reads a short story.
+the story is about a cat and a dog.
+the teacher writes a word on the board.
+the children read the word together.
+the girl asks a question.
+the teacher gives a clear answer.
+the children learn something new each day.
+
+i like to read books.
+i read a little every morning.
+i write a few words in my notebook.
+when i do not understand a word i ask for help.
+my friend reads the story with me.
+we talk about the story after reading.
+we learn by asking questions.
+we practice a little every day.
+
+i write a small program.
+the program reads a line of text.
+it turns the text into tokens.
+each token has a number.
+the model uses the numbers as input.
+the model predicts the next token.
+i compare the prediction with the target.
+i train the model and try again.
+
+the red book is on the table.
+the blue book is beside the red book.
+the green cup is near the window.
+the yellow ball is under the chair.
+the small box is inside the large box.
+the door is behind the boy.
+the girl stands in front of the tree.
+the cat sits between the two chairs.
+
+one morning a boy finds a small cat.
+the cat is cold and hungry.
+the boy brings the cat into the house.
+he puts a bowl of water on the floor.
+the cat drinks the water.
+then the boy gives the cat some food.
+the cat sleeps on a warm mat.
+the next morning the cat plays in the garden.
+
+a girl walks to the park with her dog.
+she carries a blue ball in her hand.
+she throws the ball across the grass.
+the dog runs after the ball.
+the dog brings the ball back to her.
+they play until the sun goes down.
+then the girl and the dog walk home.
+at home the dog sleeps beside her chair.
+
+today i read a story about the moon.
+the story makes me ask a question.
+i look for an answer in another book.
+i write the answer in my notebook.
+then i explain it to my friend.
+my friend asks another question.
+we open the book and read together.
+there is always something new to learn.

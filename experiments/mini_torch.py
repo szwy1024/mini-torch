@@ -1,7 +1,7 @@
 """纯 Python 教学框架：张量、自动微分与单头 TransformerBlock。
 
 运行：python experiments/mini_torch.py
-main 演示 Transformer 输出头与交叉熵损失的简单分类训练。
+main 演示文本分词、分块训练和逐 token 文本生成。
 基础算子经 Dispatcher 在 CPU 执行，组合模块复用 Value 的自动微分。
 """
 
@@ -15,6 +15,8 @@ from math import prod
 from math import exp, log
 import math
 import random
+import argparse
+from pathlib import Path
 from typing import Callable, Generator, Sequence
 from typing import Iterator
 
@@ -852,7 +854,7 @@ class ExecuteLayer:
     def call_kernel(
         self, op: str, x: _Meta, y: _Meta | float | None = None, *, options: OpOptions
     ) -> _Meta:
-        # 仍固定选 CPU；GPUBackend 只是占位，未实现 Metal 或设备存储。
+        # 仍固定选 CPU；GPUBackend 只是占位。
         kernel = self.kernels["cpu"][op]
         if self.dispatcher._trace:
             print(f"  CPU kernel: {op}")
@@ -1093,6 +1095,17 @@ def get_max_index(input: Value) -> Value:
     return Value(_Meta(index, (rows,)), require_grad=False)
 
 
+def generate_mask(seq_len:int)->Value:
+    result : list[float]= []
+    for i in range(seq_len):
+        for j in range(seq_len):
+            if j > i:
+                result.append(float("-inf"))
+            else :
+                result.append(0.0)
+    return Value(_Meta(result,(seq_len,seq_len,)),require_grad=False)
+            
+
 class Parameter(Value):
     """标记：这是模型参数，而不是普通的中间计算结果。"""
 
@@ -1226,6 +1239,7 @@ class Attention(Module):
         self.q_proj = Linear(embed_dim, embed_dim, bias=bias, rng=rng)
         self.k_proj = Linear(embed_dim, embed_dim, bias=bias, rng=rng)
         self.v_proj = Linear(embed_dim, embed_dim, bias=bias, rng=rng)
+        
 
     def forward(self, x: Value) -> Value:
         if x.shape[-1] != self.embed_dim:
@@ -1235,6 +1249,8 @@ class Attention(Module):
         value = self.v_proj(x)
         scale = 1.0 / math.sqrt(self.embed_dim)
         scores = (query @ key.T) * scale
+        causal_mask = generate_mask(scores.shape[0])
+        scores = scores + causal_mask
         attention_weights = scores.softmax(dim=-1)
         return attention_weights @ value
 
@@ -1389,8 +1405,9 @@ class Transformer(Module):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
-        self.embedding = Embedding(vocab_size, embed_dim, rng=rng)
-        self.position_encode = Embedding(max_sequence_len, embed_dim, rng=rng)
+        self.tokens_embedding = Embedding(vocab_size, embed_dim, rng=rng)
+        self.max_sequence_len = max_sequence_len
+        self.position_embedding= Embedding(max_sequence_len, embed_dim, rng=rng)
         self.transformer_block1 = TransformerBlock(
             embed_dim,
             hidden_dim,
@@ -1427,7 +1444,7 @@ class Transformer(Module):
             _Meta(list(range(seq_len)), (seq_len,)),
             require_grad=False,
         )
-        embedding = self.embedding(x) + self.position_encode(position_ids)
+        embedding = self.tokens_embedding(x) + self.position_embedding(position_ids)
         hidden1 = self.transformer_block1(embedding)
         hidden2 = self.transformer_block2(hidden1)
         hidden3 = self.transformer_block3(hidden2)
@@ -1436,43 +1453,137 @@ class Transformer(Module):
         return output
 
 
-def main() -> None:
-    random.seed(42)
-    vocab_size = 40
-    input_ids = [0, 1, 2, 3, 2, 1, 5, 25]
-    target_ids = [0, 1, 2, 7, 2, 1, 5, 25]
-    seq_len = len(input_ids)
-    x = Value(_Meta(input_ids, (seq_len,)), name="input", require_grad=False)
+def make_training_blocks(
+    tokens: Sequence[int], block_size: int
+) -> list[tuple[Value, list[int]]]:
+    """每块读取至多 T+1 个 token，组成错位的输入和标签；保留不足 T 的尾块。"""
+    if block_size < 1:
+        raise ValueError("block_size 必须大于 0")
+    if len(tokens) < 2:
+        raise ValueError("训练文本至少需要两个 token")
 
-    transformer = Transformer(
-        vocab_size,
+    blocks = []
+    for start in range(0, len(tokens) - 1, block_size):
+        block = list(tokens[start : start + block_size + 1])
+        inputs = Value(_Meta(block[:-1], (len(block) - 1,)), require_grad=False)
+        blocks.append((inputs, block[1:]))
+    return blocks
+
+
+def evaluate(
+    model: Transformer, blocks: Sequence[tuple[Value, list[int]]]
+) -> tuple[float, float]:
+    """统计平均交叉熵和 token 正确率，按 token 数加权。"""
+    total_loss = 0.0
+    correct = 0
+    count = 0
+    with no_grad():
+        for inputs, targets in blocks:
+            logits = model(inputs)
+            total_loss += cross_entropy(logits, targets).data[0] * len(targets)
+            predictions = get_max_index(logits)
+            for predicted, target in zip(predictions.data, targets, strict=True):
+                if predicted == target:
+                    correct += 1
+            count += len(targets)
+    return total_loss / count, correct / count
+
+
+def generate(
+    model: Transformer,
+    prompt_ids: Sequence[int],
+    max_new_tokens: int = 32,
+    *,
+    eos_token_id: int | None = None,
+) -> list[int]:
+    """自回归解码，采用贪心策略。"""
+    if not prompt_ids:
+        raise ValueError("提示文本至少需要一个 token")
+    tokens = list(prompt_ids)
+    with no_grad():
+        for _ in range(max_new_tokens):
+            context = tokens[-model.max_sequence_len :]
+            inputs = Value(_Meta(context, (len(context),)), require_grad=False)
+            logits = model(inputs)
+            last_row = logits.data[-model.vocab_size :]
+            next_token = last_row.index(max(last_row))
+            tokens.append(next_token)
+            if next_token == eos_token_id:
+                break
+    return tokens
+
+
+def main() -> None:
+    from tokenizers import Tokenizer
+
+    parser = argparse.ArgumentParser(description="mini-torch 文本训练与生成")
+    parser.add_argument(
+        "--text-file",
+        type=Path,
+        default=Path(__file__).parent / "data" / "train_text.txt",
+        help="UTF-8 训练文本路径",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default="hf-internal-testing/tiny-random-gpt2",
+        help="Hugging Face 仓库名或本地 tokenizer.json 路径",
+    )
+    parser.add_argument("--prompt", default="the cat", help="生成时的提示文本")
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=0.07)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    args = parser.parse_args()
+
+    tokenizer_path = Path(args.tokenizer)
+    if tokenizer_path.is_file():
+        tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    else:
+        tokenizer = Tokenizer.from_pretrained(args.tokenizer)
+    # 文本由本框架分块，保留原始 token，不让分词器预先截断或补齐。
+    tokenizer.no_truncation()
+    tokenizer.no_padding()
+
+    text = args.text_file.read_text(encoding="utf-8")
+    tokens = tokenizer.encode(text, add_special_tokens=False).ids
+    eos_token_id = tokenizer.token_to_id("<|endoftext|>")
+    if eos_token_id is not None:
+        tokens.append(eos_token_id)
+    blocks = make_training_blocks(tokens, args.block_size)
+
+    model = Transformer(
+        vocab_size=tokenizer.get_vocab_size(),
         embed_dim=16,
         hidden_dim=32,
         attention_bias=True,
         fnn_bias1=True,
         fnn_bias2=True,
         lm_bias=True,
+        max_sequence_len=args.block_size,
+        rng=random.Random(22),
     )
-    optimizer = SGD(transformer.parameters(), lr=0.05)
+    optimizer = SGD(model.parameters(), lr=args.lr)
+    print(f"词表大小：{model.vocab_size}；语料 token长度：{len(tokens)}；训练块大小：{len(blocks)}")
+    initial_loss, _ = evaluate(model, blocks)
+    print(f"训练前 loss：{initial_loss:.4f}")
 
-    for step in range(300):
+    for step in range(args.steps):
+        inputs, targets = blocks[step % len(blocks)]
         optimizer.zero_grad()
-        logits = transformer(x)
-        loss = cross_entropy(logits, target_ids)
+        loss = cross_entropy(model(inputs), targets)
         loss.backward()
         optimizer.step()
-
-        if step % 10 == 0:
+        if step % 20 == 0:
             print(f"step {step}: loss={loss.data[0]:.4f}")
 
-    with no_grad():
-        logits = transformer(x)
-
-    predictions = get_max_index(logits)
-
-    print("输入：", input_ids)
-    print("目标：", target_ids)
-    print("预测：", predictions)
+    final_loss, accuracy = evaluate(model, blocks)
+    print(f"训练后 loss：{final_loss:.4f}；训练集正确率：{accuracy:.2%}")
+    prompt_ids = tokenizer.encode(args.prompt, add_special_tokens=False).ids
+    output_ids = generate(
+        model, prompt_ids, args.max_new_tokens, eos_token_id=eos_token_id
+    )
+    print("提示文本：", args.prompt)
+    print("生成文本：", tokenizer.decode(output_ids, skip_special_tokens=True))
 
 
 if __name__ == "__main__":
