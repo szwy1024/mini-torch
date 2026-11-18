@@ -7,6 +7,7 @@ main 演示文本分词、分块训练和逐 token 文本生成。
 
 from __future__ import annotations
 
+from array import array
 from collections import deque
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
@@ -75,10 +76,10 @@ def enable_grad() -> AbstractContextManager[None]:
 
 
 class Storage:
-    """实际数值。教学简化：用 list[float]，而不是底层字节缓冲区。"""
+    """连续的 CPU 数值缓冲区；使用 C double 保留原有的双精度。"""
 
     def __init__(self, data: Sequence[float]) -> None:
-        self.data = [float(value) for value in data]
+        self.data: array[float] = array("d", data)
 
 
 class _Meta:
@@ -94,7 +95,7 @@ class _Meta:
             raise ValueError("数据长度与 shape 不匹配")
 
     @property
-    def data(self) -> list[float]:
+    def data(self) -> array[float]:
         return self.storage.data
 
     @property
@@ -118,7 +119,7 @@ class _Meta:
         return _Meta([1.0] * meta.numel, meta.shape)
 
     def __repr__(self) -> str:
-        return f"_Meta(data={self.data}, shape={self.shape})"
+        return f"_Meta(data={self.data.tolist()}, shape={self.shape})"
 
 
 @dataclass(frozen=True)
@@ -179,12 +180,14 @@ class CPUBackend(Backend):
         other_k, n = y.shape
         if k != other_k:
             raise ValueError(f"矩阵内维不匹配：{x.shape} @ {y.shape}")
+        x_data, y_data = x.data, y.data
         result = [0.0] * (m * n)
         for row in range(m):
+            row_start = row * k
             for col in range(n):
                 # 行优先：x[row, inner] 和 y[inner, col] 的一维下标。
                 result[row * n + col] = sum(
-                    x.data[row * k + inner] * y.data[inner * n + col]
+                    x_data[row_start + inner] * y_data[inner * n + col]
                     for inner in range(k)
                 )
         return _Meta(result, (m, n))
@@ -444,7 +447,7 @@ class Value:
             self.node = LeafNode(self)
 
     @property
-    def data(self) -> list[float]:
+    def data(self) -> array[float]:
         return self.meta.data
 
     @property
@@ -563,7 +566,7 @@ class Value:
         return _dispatch.call("scatter", self, indices, size=size, dim=dim)
 
     def __repr__(self) -> str:
-        return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
+        return f"Value(data={self.data.tolist()}, shape={self.shape}, require_grad={self.require_grad})"
 
     # create_graph 表示是否在反向计算过程中再次构造反向计算图
     def backward(
