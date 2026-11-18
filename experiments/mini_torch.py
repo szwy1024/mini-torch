@@ -1,7 +1,7 @@
 """纯 Python 教学框架：张量、自动微分与单头 TransformerBlock。
 
 运行：python experiments/mini_torch.py
-main 演示 FFN 的前向与反向，以及 TransformerBlock 的简单回归训练。
+main 演示 Transformer 输出头与交叉熵损失的简单分类训练。
 基础算子经 Dispatcher 在 CPU 执行，组合模块复用 Value 的自动微分。
 """
 
@@ -36,6 +36,14 @@ def _normalize_dim(dim: int, ndim: int, *, insert: bool = False) -> int:
 def _check_same_shape(x: _Meta, y: _Meta) -> None:
     if x.shape != y.shape:
         raise ValueError(f"需要相同形状，实际为 {x.shape} 和 {y.shape}")
+
+
+def _check_loss_targets(rows: int, classes: int, targets: Sequence[int]) -> None:
+    if len(targets) != rows:
+        raise ValueError("每一行输出需要对应一个标签")
+    if any(target < 0 or target >= classes for target in targets):
+        raise IndexError("标签超出类别范围")
+
 
 # ContextVar 保存当前执行上下文的状态，嵌套或异常退出时用 token 恢复。
 _grad_enabled: ContextVar[bool] = ContextVar("grad_enabled", default=True)
@@ -319,7 +327,7 @@ class CPUBackend(Backend):
         shape = x.shape[:dim] + (indices.numel,) + x.shape[dim + 1 :]
         return _Meta(result, shape)
 
-    def recover(self, x: _Meta, indices: _Meta, dim: int, size: int) -> _Meta:
+    def scatter(self, x: _Meta, indices: _Meta, dim: int, size: int) -> _Meta:
         """把切片累加回指定位置；未选位置为零，重复索引累加。"""
         outer = prod(x.shape[:dim])
         inner = prod(x.shape[dim + 1 :])
@@ -355,7 +363,7 @@ class CPUBackend(Backend):
             "sqrt": self.sqrt,
             "embedding": self.embedding,
             "slice": self.slice,
-            "recover": self.recover,
+            "scatter": self.scatter,
         }
 
 
@@ -434,10 +442,6 @@ class Value:
             self.node = LeafNode(self)
 
     @property
-    def storage(self) -> Storage:
-        return self.meta.storage
-
-    @property
     def data(self) -> list[float]:
         return self.meta.data
 
@@ -505,7 +509,7 @@ class Value:
     def max(self, dim: int | None = None, *, keepdim: bool = False) -> Value:
         return _dispatch.call("max", self, dim=dim, keepdim=keepdim)
 
-    def broadcast_to(self, shape: Sequence[int]) -> Value:
+    def broadcast(self, shape: Sequence[int]) -> Value:
         """从右对齐各维，长度为 1 的维度可以扩展。"""
         target = tuple(shape)
         if len(target) < len(self.shape):
@@ -535,15 +539,15 @@ class Value:
 
     def softmax(self, dim: int = -1) -> Value:
         maximum = self.max(dim, keepdim=True)
-        shifted = self - maximum.broadcast_to(self.shape)
+        shifted = self - maximum.broadcast(self.shape)
         numerator = shifted.exp()
-        return numerator / numerator.sum(dim, keepdim=True).broadcast_to(self.shape)
+        return numerator / numerator.sum(dim, keepdim=True).broadcast(self.shape)
 
     def log_softmax(self, dim: int = -1) -> Value:
         maximum = self.max(dim, keepdim=True)
-        shifted = self - maximum.broadcast_to(self.shape)
+        shifted = self - maximum.broadcast(self.shape)
         normalizer = shifted.exp().sum(dim, keepdim=True).log()
-        return shifted - normalizer.broadcast_to(self.shape)
+        return shifted - normalizer.broadcast(self.shape)
 
     def embedding(self, weight: Value) -> Value:
         return _dispatch.call("embedding", self, weight)
@@ -552,9 +556,9 @@ class Value:
         """沿 dim 按索引选取切片。"""
         return _dispatch.call("slice", self, indices, dim=dim)
 
-    def recover(self, indices: Value, size: int, dim: int = -1) -> Value:
+    def scatter(self, indices: Value, size: int, dim: int = -1) -> Value:
         """将切片累加到长度为 size 的轴上。"""
-        return _dispatch.call("recover", self, indices, size=size, dim=dim)
+        return _dispatch.call("scatter", self, indices, size=size, dim=dim)
 
     def __repr__(self) -> str:
         return f"Value(data={self.data}, shape={self.shape}, require_grad={self.require_grad})"
@@ -595,7 +599,7 @@ class Autograd:
             require_grad = False
         if op == "embedding":
             require_grad = is_grad_enabled() and other_requires_grad
-        if op in ("slice", "recover"):
+        if op in ("slice", "scatter"):
             require_grad = is_grad_enabled() and x.require_grad
         node: Node | None = None
         if self.dispatcher._trace:
@@ -634,7 +638,7 @@ class Autograd:
                     expanded_shape = x.shape[:axis] + (1,) + x.shape[axis + 1 :]
 
                 def max_backward(g: Value) -> tuple[Value, ...]:
-                    return (g.reshape(expanded_shape).broadcast_to(x.shape) * mask,)
+                    return (g.reshape(expanded_shape).broadcast(x.shape) * mask,)
 
                 node = InnerNode(
                     [x.node], max_backward, data={"mask": mask}, name="MaxBackward"
@@ -690,7 +694,7 @@ class Autograd:
                     sum_shape = input_shape[:axis] + (1,) + input_shape[axis + 1 :]
 
                 def sum_backward(grad_out: Value) -> tuple[Value, ...]:
-                    return (grad_out.reshape(sum_shape).broadcast_to(input_shape),)
+                    return (grad_out.reshape(sum_shape).broadcast(input_shape),)
 
                 node = InnerNode([x.node], sum_backward, name=f"SumBackward({x.name})")
             elif op == "expand" and options.dim is not None:
@@ -717,7 +721,7 @@ class Autograd:
                     def embedding_backward(grad_out: Value) -> tuple[Value, ...]:
                         indices = saved["indices"]
                         rows = grad_out.reshape((indices.meta.numel, weight_shape[-1]))
-                        return (rows.recover(indices, size=weight_shape[-2], dim=0),)
+                        return (rows.scatter(indices, size=weight_shape[-2], dim=0),)
 
                     node = InnerNode(
                         [y.node],
@@ -732,7 +736,7 @@ class Autograd:
                     saved = {"indices": y.clone()}
 
                 def slice_backward(grad_out: Value) -> tuple[Value, ...]:
-                    return (grad_out.recover(saved["indices"], size=size, dim=axis),)
+                    return (grad_out.scatter(saved["indices"], size=size, dim=axis),)
 
                 node = InnerNode(
                     [x.node],
@@ -740,19 +744,19 @@ class Autograd:
                     data=saved,
                     name=f"SliceBackward({x.name}, {y.name})",
                 )
-            elif op == "recover" and isinstance(y, Value) and options.dim is not None:
+            elif op == "scatter" and isinstance(y, Value) and options.dim is not None:
                 axis = options.dim
                 with no_grad():
                     saved = {"indices": y.clone()}
 
-                def recover_backward(grad_out: Value) -> tuple[Value, ...]:
+                def scatter_backward(grad_out: Value) -> tuple[Value, ...]:
                     return (grad_out.slice(saved["indices"], dim=axis),)
 
                 node = InnerNode(
                     [x.node],
-                    recover_backward,
+                    scatter_backward,
                     data=saved,
-                    name=f"RecoverBackward({x.name}, {y.name})",
+                    name=f"ScatterBackward({x.name}, {y.name})",
                 )
             elif isinstance(y, Value):
                 edges = [x.node, y.node]
@@ -862,7 +866,7 @@ class ExecuteLayer:
             return kernel(x, options.shape)
         if op == "slice":
             return kernel(x, y, options.dim)
-        if op == "recover":
+        if op == "scatter":
             return kernel(x, y, options.dim, options.size)
         return kernel(x, y)
 
@@ -1052,6 +1056,43 @@ def backward(
     _engine.run_backward(output.node, seed, create_graph=create_graph, _trace=_trace)
 
 
+def nll_loss(log_probs: Value, targets: Sequence[int]) -> Value:
+    """(N, C) 的对数概率与 N 个类别编号；返回平均负对数似然。"""
+    rows, classes = log_probs.shape
+    _check_loss_targets(rows, classes, targets)
+    offsets = [row * classes + target for row, target in enumerate(targets)]
+    indices = Value(_Meta(offsets, (rows,)), require_grad=False)
+    selected = log_probs.reshape((log_probs.meta.numel,)).slice(indices, dim=0)
+    return selected.mean() * -1.0
+
+
+def cross_entropy(logits: Value, targets: Sequence[int]) -> Value:
+    """输入 (N, C) 的原始分数，组合 log_softmax 与 nll_loss。"""
+    return nll_loss(logits.log_softmax(dim=-1), targets)
+
+
+def MSE(output: Value, targets: Value) -> Value:
+    """输入output和target，求MSE"""
+    if output.shape != targets.shape:
+        raise ValueError(f"需要相同形状，实际为 {output.shape} 和 {targets.shape}")
+    num = prod(output.shape)
+    diff = output - targets
+    return (diff * diff).mean()
+
+
+def get_max_index(input: Value) -> Value:
+    """返回每行最大值的对应的索引"""
+    index: list[int] = []
+    rows = input.shape[0]
+    cols = input.shape[1]
+    for position in range(rows):
+        start = position * cols
+        row = input.data[start : start + cols]
+        index.append(row.index(max(row)))
+
+    return Value(_Meta(index, (rows,)), require_grad=False)
+
+
 class Parameter(Value):
     """标记：这是模型参数，而不是普通的中间计算结果。"""
 
@@ -1132,11 +1173,11 @@ class Linear(Module):
                 ],
                 (in_features, out_features),
             ),
-            name="weight",
+            name="linear_weight",
         )
         if bias:
             self.bias = Parameter(
-                _Meta([0] * out_features, (out_features,)), name="bias"
+                _Meta([0] * out_features, (out_features,)), name="linear_bias"
             )
         else:
             self.bias = None
@@ -1146,7 +1187,7 @@ class Linear(Module):
         if self.bias is None:
             return result
         else:
-            return result + self.bias.broadcast_to(result.shape)
+            return result + self.bias.broadcast(result.shape)
 
 
 class LayerNorm(Module):
@@ -1159,13 +1200,13 @@ class LayerNorm(Module):
     def forward(self, x: Value) -> Value:
         if x.shape[-1] != self.features:
             raise ValueError("LayerNorm 的输入末维不匹配")
-        centered = x - x.mean(-1, keepdim=True).broadcast_to(x.shape)
+        centered = x - x.mean(-1, keepdim=True).broadcast(x.shape)
         variance = (centered * centered).mean(-1, keepdim=True)
         epsilon = Value(
             _Meta([self.eps] * variance.meta.numel, variance.shape), require_grad=False
         )
-        normalized = centered / (variance + epsilon).sqrt().broadcast_to(x.shape)
-        return normalized * self.weight.broadcast_to(x.shape) + self.bias.broadcast_to(
+        normalized = centered / (variance + epsilon).sqrt().broadcast(x.shape)
+        return normalized * self.weight.broadcast(x.shape) + self.bias.broadcast(
             x.shape
         )
 
@@ -1207,15 +1248,16 @@ class FFN(Module):
         hidden_dim: int,
         output_dim: int,
         *,
-        bias: bool = False,
+        bias1: bool = False,
+        bias2: bool = False,
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("FFN")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
-        self.linear1 = Linear(input_dim, hidden_dim, bias=bias, rng=rng)
-        self.linear2 = Linear(hidden_dim, output_dim, bias=bias, rng=rng)
+        self.linear1 = Linear(input_dim, hidden_dim, bias=bias1, rng=rng)
+        self.linear2 = Linear(hidden_dim, output_dim, bias=bias2, rng=rng)
 
     def forward(self, x: Value) -> Value:
         if x.shape[-1] != self.input_dim:
@@ -1232,7 +1274,9 @@ class TransformerBlock(Module):
         hidden_dim: int,
         *,
         eps: float = 1e-5,
-        bias: bool = False,
+        attention_bias: bool = False,
+        fnn_bias1: bool = False,
+        fnn_bias2: bool = False,
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("TransformerBlock")
@@ -1240,8 +1284,10 @@ class TransformerBlock(Module):
         self.hidden_dim = hidden_dim
         self.norm1 = LayerNorm(embed_dim, eps=eps)
         self.norm2 = LayerNorm(embed_dim, eps=eps)
-        self.attention = Attention(embed_dim, bias=bias, rng=rng)
-        self.ffn = FFN(embed_dim, hidden_dim, embed_dim, bias=bias, rng=rng)
+        self.attention = Attention(embed_dim, bias=attention_bias, rng=rng)
+        self.ffn = FFN(
+            embed_dim, hidden_dim, embed_dim, bias1=fnn_bias1, bias2=fnn_bias2, rng=rng
+        )
 
     def forward(self, x: Value) -> Value:
         if x.shape[-1] != self.embed_dim:
@@ -1273,15 +1319,57 @@ class Embedding(Module):
                 ],
                 (vocab_size, embed_dim),
             ),
-            name="weight",
+            name="embedding_weight",
         )
 
     def forward(self, x: Value) -> Value:
         return x.embedding(self.weight)
 
 
+class LM_Head(Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        vocab_size: int,
+        *,
+        bias: bool = False,
+        rng: random.Random | None = None,
+    ) -> None:
+        super().__init__("LM_Head")
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        if rng is not None:
+            generator = rng
+        else:
+            generator = random
+        bound = math.sqrt(6.0 / (vocab_size + embed_dim))
+        self.weight = Parameter(
+            _Meta(
+                [
+                    generator.uniform(-bound, bound)
+                    for _ in range(vocab_size * embed_dim)
+                ],
+                (embed_dim, vocab_size),
+            ),
+            name="lm_head_weight",
+        )
+        if bias:
+            self.bias = Parameter(
+                _Meta([0] * vocab_size, (vocab_size,)), name="lm_head_bias"
+            )
+        else:
+            self.bias = None
+
+    def forward(self, x: Value) -> Value:
+        result = x @ self.weight
+        if self.bias is None:
+            return result
+        else:
+            return result + self.bias.broadcast(result.shape)
+
+
 class Transformer(Module):
-    """transformer，包含一个嵌入层"""
+    """transformer，包含一个嵌入层，三个transformerBlock，一个输出头"""
 
     def __init__(
         self,
@@ -1290,7 +1378,10 @@ class Transformer(Module):
         hidden_dim: int,
         *,
         eps: float = 1e-5,
-        bias: bool = False,
+        attention_bias: bool = False,
+        fnn_bias1: bool = False,
+        fnn_bias2: bool = False,
+        lm_bias: bool = False,
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("Transformer")
@@ -1299,56 +1390,74 @@ class Transformer(Module):
         self.hidden_dim = hidden_dim
         self.embedding = Embedding(vocab_size, embed_dim, rng=rng)
         self.transformer_block1 = TransformerBlock(
-            embed_dim, hidden_dim, eps=eps, bias=bias, rng=rng
+            embed_dim,
+            hidden_dim,
+            eps=eps,
+            attention_bias=attention_bias,
+            fnn_bias1=fnn_bias1,
+            fnn_bias2=fnn_bias2,
+            rng=rng,
         )
         self.transformer_block2 = TransformerBlock(
-            embed_dim, hidden_dim, eps=eps, bias=bias, rng=rng
+            embed_dim,
+            hidden_dim,
+            eps=eps,
+            attention_bias=attention_bias,
+            fnn_bias1=fnn_bias1,
+            fnn_bias2=fnn_bias2,
+            rng=rng,
         )
+        self.transformer_block3 = TransformerBlock(
+            embed_dim,
+            hidden_dim,
+            eps=eps,
+            attention_bias=attention_bias,
+            fnn_bias1=fnn_bias1,
+            fnn_bias2=fnn_bias2,
+            rng=rng,
+        )
+        self.layernorm = LayerNorm(embed_dim, eps=eps)
+        self.lm_head = LM_Head(embed_dim, vocab_size, bias=lm_bias, rng=rng)
 
     def forward(self, x: Value) -> Value:
-        return self.transformer_block2(self.transformer_block1(self.embedding(x)))
+        return self.lm_head(
+            self.layernorm(
+                self.transformer_block3(
+                    self.transformer_block2(self.transformer_block1(self.embedding(x)))
+                )
+            )
+        )
 
 
 def main() -> None:
     random.seed(42)
-    x = Value(
-        _Meta([3, 4, 6, 7, 1, 3], (6,)),
-        name="input",
-        require_grad=False,
-    )
+    vocab_size = 40
+    input_ids = [0, 1, 2, 3, 2, 1, 5, 25]
+    target_ids = [0, 1, 2, 7, 2, 1, 5, 25]
+    seq_len = len(input_ids)
+    x = Value(_Meta(input_ids, (seq_len,)), name="input", require_grad=False)
 
-    # TransformerBlock 保持特征维度不变，以零张量为目标验证训练过程。
-    transformer = Transformer(10, 6, 40)
+    transformer = Transformer(vocab_size, embed_dim=16, hidden_dim=32,attention_bias=True,fnn_bias1=True,fnn_bias2=True,lm_bias=True)
+    optimizer = SGD(transformer.parameters(), lr=0.05)
 
-    optimizer = SGD(transformer.parameters(), lr=0.02)
-    target = Value(
-        _Meta(
-            [0.0] * 36,
-            (
-                6,
-                6,
-            ),
-        ),
-        require_grad=False,
-    )
-    with no_grad():
-        error = transformer(x) - target
-        initial_loss = (error * error).mean().data[0]
-
-    for _ in range(300):
+    for step in range(300):
         optimizer.zero_grad()
-        output = transformer(x)
-        error = output - target
-        loss = (error * error).mean()
+        logits = transformer(x)
+        loss = cross_entropy(logits, target_ids)
         loss.backward()
         optimizer.step()
 
+        if step % 10 == 0:
+            print(f"step {step}: loss={loss.data[0]:.4f}")
+
     with no_grad():
-        error = transformer(x) - target
-        final_loss = (error * error).mean().data[0]
-    assert all(param.grad is not None for param in transformer.parameters())
-    assert final_loss < initial_loss
-    print(f"训练 300 步：loss {initial_loss:.6f} → {final_loss:.6f}")
+        logits = transformer(x)
+
+    predictions = get_max_index(logits)
+
+    print("输入：", input_ids)
+    print("目标：", target_ids)
+    print("预测：", predictions)
 
 
 if __name__ == "__main__":
