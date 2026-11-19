@@ -3,6 +3,8 @@
 运行：python experiments/mini_torch.py
 main 演示文本分词、分块训练和逐 token 文本生成。
 基础算子经 Dispatcher 在 CPU 执行，组合模块复用 Value 的自动微分。
+dtype 默认为 float64；支持 float32 和不参与求导的 int32，不做隐式类型提升。
+CPU 运算仍使用 Python 数值，写回缓冲区时按 dtype 保存精度。
 """
 
 from __future__ import annotations
@@ -18,8 +20,26 @@ import math
 import random
 import argparse
 from pathlib import Path
-from typing import Callable, Generator, Sequence
+from typing import Callable, Generator, Literal, Sequence
 from typing import Iterator
+
+
+DType = Literal["float64", "float32", "int32"]
+
+
+def _check_same_dtype(x: _Meta, y: _Meta) -> None:
+    if x.dtype != y.dtype:
+        raise TypeError(f"需要相同 dtype，实际为 {x.dtype} 和 {y.dtype}")
+
+
+def _check_floating_dtype(dtype: DType) -> None:
+    if dtype == "int32":
+        raise TypeError("此操作需要 float32 或 float64")
+
+
+def _check_indices(indices: _Meta) -> None:
+    if indices.dtype != "int32":
+        raise TypeError("索引需要 int32")
 
 
 def _normalize_dim(dim: int, ndim: int, *, insert: bool = False) -> int:
@@ -76,27 +96,47 @@ def enable_grad() -> AbstractContextManager[None]:
 
 
 class Storage:
-    """连续的 CPU 数值缓冲区；使用 C double 保留原有的双精度。"""
+    """连续的 CPU 数值缓冲区；dtype 与数组的实际元素格式一致。"""
 
-    def __init__(self, data: Sequence[float]) -> None:
-        self.data: array[float] = array("d", data)
+    def __init__(self, data: Sequence[float], dtype: DType = "float64") -> None:
+        self.dtype: DType = dtype
+        self.data: array[float] | array[int]
+        if dtype == "int32":
+            integers = []
+            for value in data:
+                if not isinstance(value, int):
+                    raise TypeError("int32 数据必须是整数")
+                integers.append(value)
+            self.data = array("i", integers)
+        elif dtype == "float32":
+            self.data = array("f", data)
+        elif dtype == "float64":
+            self.data = array("d", data)
+        else:
+            raise TypeError(f"不支持 dtype={dtype}")
 
 
 class _Meta:
     """数值张量描述：存储 + 形状；不包含自动微分信息。"""
 
-    def __init__(self, data: Sequence[float], shape: Sequence[int]) -> None:
+    def __init__(
+        self, data: Sequence[float], shape: Sequence[int], *, dtype: DType = "float64"
+    ) -> None:
         # 固定形状，避免外部修改传入的 shape 列表影响已有张量。
         self.shape = tuple(shape)
         if any(dim < 0 for dim in self.shape):
             raise ValueError("shape 不能包含负数")
-        self.storage = Storage(data)
+        self.storage = Storage(data, dtype)
         if len(self.data) != self.numel:
             raise ValueError("数据长度与 shape 不匹配")
 
     @property
-    def data(self) -> array[float]:
+    def data(self) -> array[float] | array[int]:
         return self.storage.data
+
+    @property
+    def dtype(self) -> DType:
+        return self.storage.dtype
 
     @property
     def numel(self) -> int:
@@ -108,18 +148,18 @@ class _Meta:
         return len(self.shape)
 
     def clone(self) -> _Meta:
-        return _Meta(self.data, self.shape)
+        return _Meta(self.data, self.shape, dtype=self.dtype)
 
     @staticmethod
     def zeros_like(meta: _Meta) -> _Meta:
-        return _Meta([0.0] * meta.numel, meta.shape)
+        return _Meta([0] * meta.numel, meta.shape, dtype=meta.dtype)
 
     @staticmethod
     def ones_like(meta: _Meta) -> _Meta:
-        return _Meta([1.0] * meta.numel, meta.shape)
+        return _Meta([1] * meta.numel, meta.shape, dtype=meta.dtype)
 
     def __repr__(self) -> str:
-        return f"_Meta(data={self.data.tolist()}, shape={self.shape})"
+        return f"_Meta(data={self.data.tolist()}, shape={self.shape}, dtype={self.dtype})"
 
 
 @dataclass(frozen=True)
@@ -148,32 +188,48 @@ class CPUBackend(Backend):
 
     def add(self, x: _Meta, y: _Meta) -> _Meta:
         _check_same_shape(x, y)
-        return _Meta([a + b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+        _check_same_dtype(x, y)
+        return _Meta(
+            [a + b for a, b in zip(x.data, y.data, strict=True)], x.shape, dtype=x.dtype
+        )
 
     def sub(self, x: _Meta, y: _Meta) -> _Meta:
         _check_same_shape(x, y)
-        return _Meta([a - b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+        _check_same_dtype(x, y)
+        return _Meta(
+            [a - b for a, b in zip(x.data, y.data, strict=True)], x.shape, dtype=x.dtype
+        )
 
     def mul(self, x: _Meta, y: _Meta) -> _Meta:
         """逐元素乘法，区别于 matmul。"""
         _check_same_shape(x, y)
-        return _Meta([a * b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+        _check_same_dtype(x, y)
+        return _Meta(
+            [a * b for a, b in zip(x.data, y.data, strict=True)], x.shape, dtype=x.dtype
+        )
 
     def div(self, x: _Meta, y: _Meta) -> _Meta:
         """同形状逐元素相除；不执行矩阵求逆或广播。"""
         _check_same_shape(x, y)
-        return _Meta([a / b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+        _check_same_dtype(x, y)
+        _check_floating_dtype(x.dtype)
+        return _Meta(
+            [a / b for a, b in zip(x.data, y.data, strict=True)], x.shape, dtype=x.dtype
+        )
 
     def log(self, x: _Meta) -> _Meta:
         """逐元素自然对数。"""
-        return _Meta([log(value) for value in x.data], x.shape)
+        _check_floating_dtype(x.dtype)
+        return _Meta([log(value) for value in x.data], x.shape, dtype=x.dtype)
 
     def scale(self, x: _Meta, scalar: float) -> _Meta:
         """矩阵或张量的数乘，scalar 是普通 Python 常数。"""
-        return _Meta([value * scalar for value in x.data], x.shape)
+        _check_floating_dtype(x.dtype)
+        return _Meta([value * scalar for value in x.data], x.shape, dtype=x.dtype)
 
     def matmul(self, x: _Meta, y: _Meta) -> _Meta:
         """(m, k) @ (k, n) → (m, n)，仅支持二维矩阵。"""
+        _check_same_dtype(x, y)
         if len(x.shape) != 2 or len(y.shape) != 2:
             raise ValueError("matmul 当前只支持两个二维矩阵")
         m, k = x.shape
@@ -181,7 +237,7 @@ class CPUBackend(Backend):
         if k != other_k:
             raise ValueError(f"矩阵内维不匹配：{x.shape} @ {y.shape}")
         x_data, y_data = x.data, y.data
-        result = [0.0] * (m * n)
+        result: list[float] = [0] * (m * n)
         for row in range(m):
             row_start = row * k
             for col in range(n):
@@ -190,7 +246,7 @@ class CPUBackend(Backend):
                     x_data[row_start + inner] * y_data[inner * n + col]
                     for inner in range(k)
                 )
-        return _Meta(result, (m, n))
+        return _Meta(result, (m, n), dtype=x.dtype)
 
     def clone(self, x: _Meta) -> _Meta:
         return x.clone()
@@ -203,6 +259,7 @@ class CPUBackend(Backend):
         return _Meta(
             [x.data[row * cols + col] for col in range(cols) for row in range(rows)],
             (cols, rows),
+            dtype=x.dtype,
         )
 
     def sum(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
@@ -212,7 +269,7 @@ class CPUBackend(Backend):
                 shape = (1,) * x.ndim
             else:
                 shape = ()
-            return _Meta([sum(x.data)], shape)
+            return _Meta([sum(x.data)], shape, dtype=x.dtype)
 
         # 标量允许 dim=0/-1；归约后仍为标量。
         if x.ndim == 0:
@@ -223,7 +280,7 @@ class CPUBackend(Backend):
         result: list[float] = []
         for outer_index in range(outer):
             for inner_index in range(inner):
-                total = 0.0
+                total: float = 0
                 for reduce_index in range(reduce_size):
                     offset = (
                         outer_index * reduce_size + reduce_index
@@ -235,7 +292,7 @@ class CPUBackend(Backend):
         else:
             middle = ()
         shape = x.shape[:dim] + middle + x.shape[dim + 1 :]
-        return _Meta(result, shape)
+        return _Meta(result, shape, dtype=x.dtype)
 
     def expand(self, x: _Meta, dim: int, size: int) -> _Meta:
         """本例定义：在 dim 插入长度为 size 的新维，并复制数据。
@@ -250,23 +307,25 @@ class CPUBackend(Backend):
             block = x.data[outer_index * inner : (outer_index + 1) * inner]
             for _ in range(size):
                 result.extend(block)
-        return _Meta(result, x.shape[:dim] + (size,) + x.shape[dim:])
+        return _Meta(result, x.shape[:dim] + (size,) + x.shape[dim:], dtype=x.dtype)
 
     def reshape(self, x: _Meta, shape: Sequence[int]) -> _Meta:
         """连续数据的形状转换，本例复制数据，暂不实现共享存储的 view。"""
         target = tuple(shape)
         if prod(target) != x.numel:
             raise ValueError(f"reshape 元素数不匹配：{x.shape} → {target}")
-        return _Meta(x.data, target)
+        return _Meta(x.data, target, dtype=x.dtype)
 
     def exponential(self, x: _Meta) -> _Meta:
-        return _Meta([exp(data) for data in x.data], x.shape)
+        _check_floating_dtype(x.dtype)
+        return _Meta([exp(data) for data in x.data], x.shape, dtype=x.dtype)
 
     def relu(self, x: _Meta) -> _Meta:
-        return _Meta([max(data, 0) for data in x.data], x.shape)
+        return _Meta([max(data, 0) for data in x.data], x.shape, dtype=x.dtype)
 
     def sqrt(self, x: _Meta) -> _Meta:
-        return _Meta([math.sqrt(v) for v in x.data], x.shape)
+        _check_floating_dtype(x.dtype)
+        return _Meta([math.sqrt(v) for v in x.data], x.shape, dtype=x.dtype)
 
     def max(self, x: _Meta, dim: int | None = None, *, keepdim: bool = False) -> _Meta:
         return self._max_with_mask(x, dim, keepdim)[0]
@@ -282,32 +341,35 @@ class CPUBackend(Backend):
     ) -> tuple[_Meta, _Meta]:
         """返回最大值和首个最大位置掩码；并列最大值选择第一个。"""
         if dim is None or x.ndim == 0:
-            best = max(x.data)
-            mask = [0.0] * x.numel
-            mask[x.data.index(best)] = 1.0
+            winner = max(range(x.numel), key=x.data.__getitem__)
+            best = x.data[winner]
+            mask = [0] * x.numel
+            mask[winner] = 1
             if keepdim:
                 shape = (1,) * x.ndim
             else:
                 shape = ()
-            return _Meta([best], shape), _Meta(mask, x.shape)
+            return _Meta([best], shape, dtype=x.dtype), _Meta(mask, x.shape, dtype=x.dtype)
         axis = dim
         width = x.shape[axis]
         outer, inner = prod(x.shape[:axis]), prod(x.shape[axis + 1 :])
-        output, mask = [], [0.0] * x.numel
+        output, mask = [], [0] * x.numel
         for before in range(outer):
             for after in range(inner):
                 offsets = [(before * width + j) * inner + after for j in range(width)]
                 winner = max(offsets, key=lambda index: x.data[index])
                 output.append(x.data[winner])
-                mask[winner] = 1.0
+                mask[winner] = 1
         if keepdim:
             middle = (1,)
         else:
             middle = ()
         shape = x.shape[:axis] + middle + x.shape[axis + 1 :]
-        return _Meta(output, shape), _Meta(mask, x.shape)
+        return _Meta(output, shape, dtype=x.dtype), _Meta(mask, x.shape, dtype=x.dtype)
 
     def embedding(self, tokens: _Meta, weight: _Meta) -> _Meta:
+        _check_indices(tokens)
+        _check_floating_dtype(weight.dtype)
         embed_dim = weight.shape[-1]
         result: list[float] = []
 
@@ -317,10 +379,11 @@ class CPUBackend(Backend):
             result.extend(weight.data[start : start + embed_dim])
 
         output_shape = tokens.shape + (embed_dim,)
-        return _Meta(result, output_shape)
+        return _Meta(result, output_shape, dtype=weight.dtype)
 
     def slice(self, x: _Meta, indices: _Meta, dim: int) -> _Meta:
         """沿 dim 轴按一维索引选取切片，保留索引的顺序和重复项。"""
+        _check_indices(indices)
         outer = prod(x.shape[:dim])
         inner = prod(x.shape[dim + 1 :])
         length = x.shape[dim]
@@ -330,22 +393,23 @@ class CPUBackend(Backend):
                 start = (before * length + int(index)) * inner
                 result.extend(x.data[start : start + inner])
         shape = x.shape[:dim] + (indices.numel,) + x.shape[dim + 1 :]
-        return _Meta(result, shape)
+        return _Meta(result, shape, dtype=x.dtype)
 
     def scatter(self, x: _Meta, indices: _Meta, dim: int, size: int) -> _Meta:
         """把切片累加回指定位置；未选位置为零，重复索引累加。"""
+        _check_indices(indices)
         outer = prod(x.shape[:dim])
         inner = prod(x.shape[dim + 1 :])
         length = x.shape[dim]
         shape = x.shape[:dim] + (size,) + x.shape[dim + 1 :]
-        result = [0.0] * prod(shape)
+        result: list[float] = [0] * prod(shape)
         for before in range(outer):
             for position, index in enumerate(indices.data):
                 source = (before * length + position) * inner
                 target = (before * size + int(index)) * inner
                 for after in range(inner):
                     result[target + after] += x.data[source + after]
-        return _Meta(result, shape)
+        return _Meta(result, shape, dtype=x.dtype)
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {
@@ -378,7 +442,10 @@ class GPUBackend(Backend):
 
     def add(self, x: _Meta, y: _Meta) -> _Meta:
         _check_same_shape(x, y)
-        return _Meta([a + b for a, b in zip(x.data, y.data, strict=True)], x.shape)
+        _check_same_dtype(x, y)
+        return _Meta(
+            [a + b for a, b in zip(x.data, y.data, strict=True)], x.shape, dtype=x.dtype
+        )
 
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         return {"add": self.add}
@@ -438,6 +505,8 @@ class Value:
         require_grad: bool = True,
         node: Node | None = None,
     ) -> None:
+        if require_grad:
+            _check_floating_dtype(meta.dtype)
         self.meta = meta
         self.name = name
         self.grad: Value | None = None
@@ -447,8 +516,12 @@ class Value:
             self.node = LeafNode(self)
 
     @property
-    def data(self) -> array[float]:
+    def data(self) -> array[float] | array[int]:
         return self.meta.data
+
+    @property
+    def dtype(self) -> DType:
+        return self.meta.dtype
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -566,7 +639,7 @@ class Value:
         return _dispatch.call("scatter", self, indices, size=size, dim=dim)
 
     def __repr__(self) -> str:
-        return f"Value(data={self.data.tolist()}, shape={self.shape}, require_grad={self.require_grad})"
+        return f"Value(data={self.data.tolist()}, shape={self.shape}, dtype={self.dtype}, require_grad={self.require_grad})"
 
     # create_graph 表示是否在反向计算过程中再次构造反向计算图
     def backward(
@@ -672,7 +745,7 @@ class Autograd:
                     else:
                         mask_data.append(0.0)
                 mask = Value(
-                    _Meta(mask_data, x.shape),
+                    _Meta(mask_data, x.shape, dtype=x.dtype),
                     name=f"ReluMask({x.name})",
                     require_grad=False,
                 )
@@ -1040,7 +1113,8 @@ class SGD:
         with no_grad():
             for param in self.params:
                 if param.grad is not None:
-                    param.data[:] = (param - param.grad * self.lr).data
+                    updated = param - param.grad * self.lr
+                    memoryview(param.data)[:] = memoryview(updated.data)
 
 
 def backward(
@@ -1058,6 +1132,7 @@ def backward(
         seed = Value(_Meta.ones_like(output.meta), name="seed", require_grad=False)
     if seed.shape != output.shape:
         raise ValueError(f"seed.shape={seed.shape} 与输出形状 {output.shape} 不一致")
+    _check_same_dtype(seed.meta, output.meta)
     _engine.run_backward(output.node, seed, create_graph=create_graph, _trace=_trace)
 
 
@@ -1066,7 +1141,7 @@ def nll_loss(log_probs: Value, targets: Sequence[int]) -> Value:
     rows, classes = log_probs.shape
     _check_loss_targets(rows, classes, targets)
     offsets = [row * classes + target for row, target in enumerate(targets)]
-    indices = Value(_Meta(offsets, (rows,)), require_grad=False)
+    indices = Value(_Meta(offsets, (rows,), dtype="int32"), require_grad=False)
     selected = log_probs.reshape((log_probs.meta.numel,)).slice(indices, dim=0)
     return selected.mean() * -1.0
 
@@ -1093,20 +1168,21 @@ def get_max_index(input: Value) -> Value:
     for position in range(rows):
         start = position * cols
         row = input.data[start : start + cols]
-        index.append(row.index(max(row)))
+        index.append(max(range(cols), key=row.__getitem__))
 
-    return Value(_Meta(index, (rows,)), require_grad=False)
+    return Value(_Meta(index, (rows,), dtype="int32"), require_grad=False)
 
 
-def generate_mask(seq_len:int)->Value:
-    result : list[float]= []
+def generate_mask(seq_len: int, *, dtype: DType = "float64") -> Value:
+    _check_floating_dtype(dtype)
+    result: list[float] = []
     for i in range(seq_len):
         for j in range(seq_len):
             if j > i:
                 result.append(float("-inf"))
-            else :
+            else:
                 result.append(0.0)
-    return Value(_Meta(result,(seq_len,seq_len,)),require_grad=False)
+    return Value(_Meta(result, (seq_len, seq_len), dtype=dtype), require_grad=False)
             
 
 class Parameter(Value):
@@ -1172,6 +1248,7 @@ class Linear(Module):
         out_features: int,
         *,
         bias: bool = True,
+        dtype: DType = "float64",
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("Linear")
@@ -1188,12 +1265,14 @@ class Linear(Module):
                     for _ in range(in_features * out_features)
                 ],
                 (in_features, out_features),
+                dtype=dtype,
             ),
             name="linear_weight",
         )
         if bias:
             self.bias = Parameter(
-                _Meta([0] * out_features, (out_features,)), name="linear_bias"
+                _Meta([0] * out_features, (out_features,), dtype=dtype),
+                name="linear_bias",
             )
         else:
             self.bias = None
@@ -1207,11 +1286,17 @@ class Linear(Module):
 
 
 class LayerNorm(Module):
-    def __init__(self, features: int, eps: float = 1e-5) -> None:
+    def __init__(
+        self, features: int, eps: float = 1e-5, *, dtype: DType = "float64"
+    ) -> None:
         super().__init__("LayerNorm")
         self.features, self.eps = features, eps
-        self.weight = Parameter(_Meta([1] * features, (features,)), name="gamma")
-        self.bias = Parameter(_Meta([0] * features, (features,)), name="beta")
+        self.weight = Parameter(
+            _Meta([1] * features, (features,), dtype=dtype), name="gamma"
+        )
+        self.bias = Parameter(
+            _Meta([0] * features, (features,), dtype=dtype), name="beta"
+        )
 
     def forward(self, x: Value) -> Value:
         if x.shape[-1] != self.features:
@@ -1219,7 +1304,8 @@ class LayerNorm(Module):
         centered = x - x.mean(-1, keepdim=True).broadcast(x.shape)
         variance = (centered * centered).mean(-1, keepdim=True)
         epsilon = Value(
-            _Meta([self.eps] * variance.meta.numel, variance.shape), require_grad=False
+            _Meta([self.eps] * variance.meta.numel, variance.shape, dtype=variance.dtype),
+            require_grad=False,
         )
         normalized = centered / (variance + epsilon).sqrt().broadcast(x.shape)
         return normalized * self.weight.broadcast(x.shape) + self.bias.broadcast(
@@ -1235,13 +1321,14 @@ class Attention(Module):
         embed_dim: int,
         *,
         bias: bool = False,
+        dtype: DType = "float64",
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("Attention")
         self.embed_dim = embed_dim
-        self.q_proj = Linear(embed_dim, embed_dim, bias=bias, rng=rng)
-        self.k_proj = Linear(embed_dim, embed_dim, bias=bias, rng=rng)
-        self.v_proj = Linear(embed_dim, embed_dim, bias=bias, rng=rng)
+        self.q_proj = Linear(embed_dim, embed_dim, bias=bias, dtype=dtype, rng=rng)
+        self.k_proj = Linear(embed_dim, embed_dim, bias=bias, dtype=dtype, rng=rng)
+        self.v_proj = Linear(embed_dim, embed_dim, bias=bias, dtype=dtype, rng=rng)
         
 
     def forward(self, x: Value) -> Value:
@@ -1252,7 +1339,7 @@ class Attention(Module):
         value = self.v_proj(x)
         scale = 1.0 / math.sqrt(self.embed_dim)
         scores = (query @ key.T) * scale
-        causal_mask = generate_mask(scores.shape[0])
+        causal_mask = generate_mask(scores.shape[0], dtype=scores.dtype)
         scores = scores + causal_mask
         attention_weights = scores.softmax(dim=-1)
         return attention_weights @ value
@@ -1269,14 +1356,15 @@ class FFN(Module):
         *,
         bias1: bool = False,
         bias2: bool = False,
+        dtype: DType = "float64",
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("FFN")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
-        self.linear1 = Linear(input_dim, hidden_dim, bias=bias1, rng=rng)
-        self.linear2 = Linear(hidden_dim, output_dim, bias=bias2, rng=rng)
+        self.linear1 = Linear(input_dim, hidden_dim, bias=bias1, dtype=dtype, rng=rng)
+        self.linear2 = Linear(hidden_dim, output_dim, bias=bias2, dtype=dtype, rng=rng)
 
     def forward(self, x: Value) -> Value:
         if x.shape[-1] != self.input_dim:
@@ -1296,16 +1384,23 @@ class TransformerBlock(Module):
         attention_bias: bool = False,
         fnn_bias1: bool = False,
         fnn_bias2: bool = False,
+        dtype: DType = "float64",
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("TransformerBlock")
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
-        self.norm1 = LayerNorm(embed_dim, eps=eps)
-        self.norm2 = LayerNorm(embed_dim, eps=eps)
-        self.attention = Attention(embed_dim, bias=attention_bias, rng=rng)
+        self.norm1 = LayerNorm(embed_dim, eps=eps, dtype=dtype)
+        self.norm2 = LayerNorm(embed_dim, eps=eps, dtype=dtype)
+        self.attention = Attention(embed_dim, bias=attention_bias, dtype=dtype, rng=rng)
         self.ffn = FFN(
-            embed_dim, hidden_dim, embed_dim, bias1=fnn_bias1, bias2=fnn_bias2, rng=rng
+            embed_dim,
+            hidden_dim,
+            embed_dim,
+            bias1=fnn_bias1,
+            bias2=fnn_bias2,
+            dtype=dtype,
+            rng=rng,
         )
 
     def forward(self, x: Value) -> Value:
@@ -1320,7 +1415,12 @@ class Embedding(Module):
     """嵌入层，把输入的tokens序列变成向量"""
 
     def __init__(
-        self, vocab_size: int, embed_dim: int, *, rng: random.Random | None = None
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        *,
+        dtype: DType = "float64",
+        rng: random.Random | None = None,
     ) -> None:
         super().__init__("Embedding")
         self.vocab_size = vocab_size
@@ -1337,6 +1437,7 @@ class Embedding(Module):
                     for _ in range(vocab_size * embed_dim)
                 ],
                 (vocab_size, embed_dim),
+                dtype=dtype,
             ),
             name="embedding_weight",
         )
@@ -1352,6 +1453,7 @@ class LM_Head(Module):
         vocab_size: int,
         *,
         bias: bool = False,
+        dtype: DType = "float64",
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("LM_Head")
@@ -1369,12 +1471,13 @@ class LM_Head(Module):
                     for _ in range(vocab_size * embed_dim)
                 ],
                 (embed_dim, vocab_size),
+                dtype=dtype,
             ),
             name="lm_head_weight",
         )
         if bias:
             self.bias = Parameter(
-                _Meta([0] * vocab_size, (vocab_size,)), name="lm_head_bias"
+                _Meta([0] * vocab_size, (vocab_size,), dtype=dtype), name="lm_head_bias"
             )
         else:
             self.bias = None
@@ -1402,15 +1505,18 @@ class Transformer(Module):
         fnn_bias2: bool = False,
         lm_bias: bool = False,
         max_sequence_len: int = 100,
+        dtype: DType = "float64",
         rng: random.Random | None = None,
     ) -> None:
         super().__init__("Transformer")
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
-        self.tokens_embedding = Embedding(vocab_size, embed_dim, rng=rng)
+        self.tokens_embedding = Embedding(vocab_size, embed_dim, dtype=dtype, rng=rng)
         self.max_sequence_len = max_sequence_len
-        self.position_embedding= Embedding(max_sequence_len, embed_dim, rng=rng)
+        self.position_embedding = Embedding(
+            max_sequence_len, embed_dim, dtype=dtype, rng=rng
+        )
         self.transformer_block1 = TransformerBlock(
             embed_dim,
             hidden_dim,
@@ -1418,6 +1524,7 @@ class Transformer(Module):
             attention_bias=attention_bias,
             fnn_bias1=fnn_bias1,
             fnn_bias2=fnn_bias2,
+            dtype=dtype,
             rng=rng,
         )
         self.transformer_block2 = TransformerBlock(
@@ -1427,6 +1534,7 @@ class Transformer(Module):
             attention_bias=attention_bias,
             fnn_bias1=fnn_bias1,
             fnn_bias2=fnn_bias2,
+            dtype=dtype,
             rng=rng,
         )
         self.transformer_block3 = TransformerBlock(
@@ -1436,15 +1544,16 @@ class Transformer(Module):
             attention_bias=attention_bias,
             fnn_bias1=fnn_bias1,
             fnn_bias2=fnn_bias2,
+            dtype=dtype,
             rng=rng,
         )
-        self.layernorm = LayerNorm(embed_dim, eps=eps)
-        self.lm_head = LM_Head(embed_dim, vocab_size, bias=lm_bias, rng=rng)
+        self.layernorm = LayerNorm(embed_dim, eps=eps, dtype=dtype)
+        self.lm_head = LM_Head(embed_dim, vocab_size, bias=lm_bias, dtype=dtype, rng=rng)
 
     def forward(self, x: Value) -> Value:
         seq_len = x.shape[0]
         position_ids = Value(
-            _Meta(list(range(seq_len)), (seq_len,)),
+            _Meta(list(range(seq_len)), (seq_len,), dtype="int32"),
             require_grad=False,
         )
         embedding = self.tokens_embedding(x) + self.position_embedding(position_ids)
@@ -1468,7 +1577,9 @@ def make_training_blocks(
     blocks = []
     for start in range(0, len(tokens) - 1, block_size):
         block = list(tokens[start : start + block_size + 1])
-        inputs = Value(_Meta(block[:-1], (len(block) - 1,)), require_grad=False)
+        inputs = Value(
+            _Meta(block[:-1], (len(block) - 1,), dtype="int32"), require_grad=False
+        )
         blocks.append((inputs, block[1:]))
     return blocks
 
@@ -1506,10 +1617,12 @@ def generate(
     with no_grad():
         for _ in range(max_new_tokens):
             context = tokens[-model.max_sequence_len :]
-            inputs = Value(_Meta(context, (len(context),)), require_grad=False)
+            inputs = Value(
+                _Meta(context, (len(context),), dtype="int32"), require_grad=False
+            )
             logits = model(inputs)
             last_row = logits.data[-model.vocab_size :]
-            next_token = last_row.index(max(last_row))
+            next_token = max(range(model.vocab_size), key=last_row.__getitem__)
             tokens.append(next_token)
             if next_token == eos_token_id:
                 break
@@ -1534,7 +1647,8 @@ def main() -> None:
     parser.add_argument("--prompt", default="the cat", help="生成时的提示文本")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=0.07)
+    parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--dtype", choices=("float64", "float32"), default="float64")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     args = parser.parse_args()
 
@@ -1563,6 +1677,7 @@ def main() -> None:
         fnn_bias2=True,
         lm_bias=True,
         max_sequence_len=args.block_size,
+        dtype=args.dtype,
         rng=random.Random(22),
     )
     optimizer = SGD(model.parameters(), lr=args.lr)
