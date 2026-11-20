@@ -1,4 +1,4 @@
-"""教学框架的公共接口；数值后端目前仍为纯 Python CPU 实现。"""
+"""教学框架的公共接口；支持 CPU 算子与 Metal float32 矩阵乘法。"""
 
 from .storage import DType, Storage, _Meta
 from .value import Parameter, Value

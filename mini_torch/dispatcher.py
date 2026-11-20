@@ -7,7 +7,7 @@ from typing import Callable, Sequence
 
 from ._checks import _normalize_dim
 from .autograd_layer import Autograd
-from .backends import CPUBackend, GPUBackend
+from .backends import Backend, CPUBackend, GPUBackend, MetalBackend
 from .storage import _Meta
 from .value import Value
 
@@ -24,14 +24,19 @@ class OpOptions:
 
 
 class ExecuteLayer:
+    """按后端优先级，选择已注册且支持当前输入的数值实现。"""
+
     def __init__(self, dispatcher: Dispatch) -> None:
         self.dispatcher = dispatcher
-        cpu = CPUBackend("cpu")
-        gpu = GPUBackend("gpu")
-        self.kernels: dict[str, dict[str, Callable[..., _Meta]]] = {
-            "cpu": cpu.get_ability(),
-            "gpu": gpu.get_ability(),
+        self.backends: dict[str, Backend] = {
+            "metal": MetalBackend("metal"),
+            "cpu": CPUBackend("cpu"),
+            "gpu": GPUBackend("gpu"),
         }
+        self.kernels = {
+            name: backend.get_ability() for name, backend in self.backends.items()
+        }
+        self.priority = ("metal", "cpu")
 
     def apply(
         self,
@@ -51,10 +56,14 @@ class ExecuteLayer:
     def call_kernel(
         self, op: str, x: _Meta, y: _Meta | float | None = None, *, options: OpOptions
     ) -> _Meta:
-        # 仍固定选 CPU；GPUBackend 只是占位。
-        kernel = self.kernels["cpu"][op]
+        for name in self.priority:
+            kernel = self.kernels[name].get(op)
+            if kernel is not None and self.backends[name].supports(op, x, y):
+                break
+        else:
+            raise NotImplementedError(f"没有后端支持算子 {op}")
         if self.dispatcher._trace:
-            print(f"  CPU kernel: {op}")
+            print(f"  {name} kernel: {op}")
         if op in ("sum", "max", "max_mask"):
             return kernel(x, options.dim, keepdim=options.keepdim)
         if op in ("sqrt", "transpose", "clone", "exponential", "relu", "log"):
@@ -89,9 +98,9 @@ class Dispatch:
             ],
         ] = {
             "Autograd": self.autograd.apply,
-            "CPU": self.executeLayer.apply,
+            "Execute": self.executeLayer.apply,
         }
-        self.priority = ("Autograd", "CPU")
+        self.priority = ("Autograd", "Execute")
 
     def call(
         self,

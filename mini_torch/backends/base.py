@@ -15,3 +15,7 @@ class Backend:
     def get_ability(self) -> dict[str, Callable[..., _Meta]]:
         raise NotImplementedError
 
+    def supports(self, op: str, x: _Meta, y: _Meta | float | None) -> bool:
+        """算子已注册后，检查当前输入是否适用于这个后端。"""
+        return True
+
