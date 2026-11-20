@@ -1,0 +1,6 @@
+/.venv/
+/.vscode/
+/research/
+/LEARNING_GUIDE.md
+*/__pycache__/
+/.DS_Store
