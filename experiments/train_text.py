@@ -13,7 +13,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mini_torch import (
-    SGD, Transformer, Value, _Meta, cross_entropy, get_max_index, no_grad,
+    Adam, Transformer, Value, _Meta, cross_entropy, get_max_index, no_grad,
 )
 
 
@@ -102,7 +102,7 @@ def main() -> None:
     parser.add_argument("--prompt", default="the cat", help="生成时的提示文本")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=0.03)
+    parser.add_argument("--lr", type=float, default=0.002)
     parser.add_argument("--dtype", choices=("float64", "float32"), default="float64")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     args = parser.parse_args()
@@ -135,7 +135,7 @@ def main() -> None:
         dtype=args.dtype,
         rng=random.Random(22),
     )
-    optimizer = SGD(model.parameters(), lr=args.lr)
+    optimizer = Adam(model.parameters(), lr=args.lr)
     print(f"词表大小：{model.vocab_size}；语料 token长度：{len(tokens)}；训练块大小：{len(blocks)}")
     initial_loss, _ = evaluate(model, blocks)
     print(f"训练前 loss：{initial_loss:.4f}")
